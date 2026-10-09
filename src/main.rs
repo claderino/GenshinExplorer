@@ -42,7 +42,8 @@ pub enum Msg {
     Position { x: f32, y: f32, z: f32 },
     /// In-game UID identified from avatar-scene votes.
     Uid(u32),
-    /// Oculus gadget config id seen in a small command (Anemo..Luno 107001..=107008)
+    /// Oculus gadget config id seen in a small command (see
+    /// explore::OCULUS_IDS — Anemo..Cryo from the 7.1 item table)
     /// — the server-side state change when the nearby oculus is collected.
     Oculus { x: f32, z: f32 },
     /// Challenge completed (20234-shape success) — player position included.
@@ -688,8 +689,9 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                         }
 
                         // Oculus collection: the server-side gadget state
-                        // change carries an oculus config id (107001..=107008,
-                        // Anemo..Luno) in small commands. Position matching
+                        // change carries an oculus config id (see
+                        // explore::OCULUS_IDS — the full 7.1 item-table
+                        // family) in small commands. Position matching
                         // against uncollected oculus pins happens in the map.
                         if command.proto_data.len() <= 64
                             && explore::contains_oculus_config(&command.proto_data)
@@ -743,9 +745,21 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                 );
                             }
                             // Oculus ids fire only on collection — exact
-                            // packet position supplements the byte-scan path.
-                            if (107_001..=107_008).contains(&gr.id) {
-                                if let Some((x, _y, z)) = gr.pos {
+                            // packet position supplements the byte-scan
+                            // path; without a packet position (some
+                            // variants carry none) the player's current
+                            // position is a sound fallback — you stand
+                            // at the oculus when collecting it.
+                            if explore::is_oculus_id(gr.id) {
+                                let target = gr
+                                    .pos
+                                    .map(|(x, _y, z)| (x, z))
+                                    .or_else(|| {
+                                        pos_tracker
+                                            .last
+                                            .map(|(px, _py, pz)| (px, pz))
+                                    });
+                                if let Some((x, z)) = target {
                                     let _ = tx.send(Msg::Oculus { x, z });
                                 }
                             }

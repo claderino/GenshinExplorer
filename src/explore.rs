@@ -714,6 +714,39 @@ mod tests {
         assert_eq!(detect_map_layer(&[]), Some(None));
     }
 
+    /// World-oculus id set from the 7.1 item table (gi.nanoka.cc):
+    /// every family member is recognized, and the encodings match.
+    #[test]
+    fn oculus_id_set_matches_item_table() {
+        for id in [
+            107_001u64, // Anemoculus
+            107_003,    // Geoculus
+            107_014,    // Electroculus
+            107_017,    // Dendroculus
+            107_023,    // Hydroculus
+            107_028,    // Pyroculus
+            107_030,    // Lunoculus
+            107_035,    // Cryoculus
+        ] {
+            assert!(is_oculus_id(id), "id {id} should be an oculus");
+            // Its 3-byte varint encoding must be found by the byte scan.
+            let enc = [
+                (id & 0x7f) as u8 | 0x80,
+                ((id >> 7) & 0x7f) as u8 | 0x80,
+                ((id >> 14) & 0x7f) as u8,
+            ];
+            let buf = [0x00, enc[0], enc[1], enc[2], 0x00];
+            assert!(
+                contains_oculus_config(&buf),
+                "encoding {enc:?} for id {id} not detected"
+            );
+        }
+        // Non-oculus ids in the same band (shrine keys etc.).
+        assert!(!is_oculus_id(107_027)); // Natlan Shrine of Depths Key
+        assert!(!is_oculus_id(107_029)); // Jubilant Feather
+        assert!(!is_oculus_id(112_049)); // Chaos Oculus (material)
+    }
+
     /// Real captured oculus state change: cmd 652 with config 107001.
     #[test]
     fn detects_oculus_gadget_reward() {
@@ -923,15 +956,40 @@ pub fn detect_named_entity(cmd: &GameCommand) -> Option<NamedEntity> {
     Some(NamedEntity { name: name.into_owned(), entity_id, action })
 }
 
-/// Detects an oculus gadget config id (107001..=107008, Anemoculus..Lunoculus)
-/// encoded as a 3-byte LEB128 varint in the buffer: `f9c306`..`ffc306` or
-/// `80c406`. Observed in the small server-side gadget state changes that fire
-/// the moment an oculus is collected (cmds 652/26018/25131 in 7.x).
+/// World-oculus ids, from the 7.1 item table (gi.nanoka.cc):
+/// Anemo 107001, Geo 107003, Electro 107014, Dendro 107017,
+/// Hydro 107023, Pyro 107028, Luno 107030, Cryo 107035.
+/// (112049 "Chaos Oculus" is a crafting material, NOT a world oculus;
+/// 107007/107008 are legacy gadget configs kept for compatibility.)
+pub const OCULUS_IDS: [u64; 10] = [
+    107_001, 107_003, 107_007, 107_008, 107_014, 107_017, 107_023, 107_028,
+    107_030, 107_035,
+];
+
+/// Is this gadget/item id a world oculus?
+pub fn is_oculus_id(id: u64) -> bool {
+    OCULUS_IDS.contains(&id)
+}
+
+/// Detects an oculus gadget config id (see [`OCULUS_IDS`]) encoded as a
+/// 3-byte LEB128 varint in the buffer. Observed in the small server-side
+/// gadget state changes that fire the moment an oculus is collected
+/// (cmds 652/26018/25131 in 7.x).
 pub fn contains_oculus_config(buf: &[u8]) -> bool {
-    buf.windows(3).any(|w| {
-        (w[0] >= 0xf9 && w[0] <= 0xff && w[1] == 0xc3 && w[2] == 0x06)
-            || (w[0] == 0x80 && w[1] == 0xc4 && w[2] == 0x06)
-    })
+    /// Precomputed 3-byte LEB128 encodings of OCULUS_IDS.
+    const ENC: [[u8; 3]; 10] = [
+        [0xf9, 0xc3, 0x06], // 107001 Anemoculus
+        [0xfb, 0xc3, 0x06], // 107003 Geoculus
+        [0xff, 0xc3, 0x06], // 107007 (legacy)
+        [0x80, 0xc4, 0x06], // 107008 (legacy)
+        [0x86, 0xc4, 0x06], // 107014 Electroculus
+        [0x89, 0xc4, 0x06], // 107017 Dendroculus
+        [0x8f, 0xc4, 0x06], // 107023 Hydroculus
+        [0x94, 0xc4, 0x06], // 107028 Pyroculus
+        [0x96, 0xc4, 0x06], // 107030 Lunoculus
+        [0x9b, 0xc4, 0x06], // 107035 Cryoculus
+    ];
+    buf.windows(3).any(|w| ENC.iter().any(|e| w == e))
 }
 
 pub fn detect_interact(cmd: &GameCommand, gadget_entities: &HashMap<u64, ()>) -> Option<Interact> {    // Only tiny request-shaped messages are candidates.
