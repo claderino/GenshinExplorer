@@ -299,6 +299,9 @@ pub struct MapWindow {
     /// Resolved via the learned mapping, or learned from geometry when
     /// the position enters a floor overlay.
     pending_layer: Option<u64>,
+    /// The login pin-match has served its purpose (or a layer packet
+    /// arrived) — waypoint pin-matching is retired for this map session.
+    pin_match_retired: bool,
     /// When the last packet-driven layer decision happened (floor set or
     /// surface lock) — teleport pin-matching stands down for a short
     /// window after, since both fire around the same transition and the
@@ -418,6 +421,7 @@ impl MapWindow {
             pending_region: None,
             region_lock: None,
             pending_layer: None,
+            pin_match_retired: false,
             layer_authoritative_at: None,
             active_layer: None,
             layers_open: false,
@@ -506,6 +510,9 @@ impl MapWindow {
                 // Track even before resolution so the mapping manager can
                 // offer manual teaching for never-learned layers.
                 self.active_layer = Some(id);
+                // A layer packet has spoken — the login pin-match's job
+                // is done for this map session.
+                self.pin_match_retired = true;
             }
         }
     }
@@ -1942,7 +1949,7 @@ impl MapWindow {
                                 < std::time::Duration::from_secs(10)
                         })
                         .unwrap_or(false);
-                    if (!layer_stateless || layer_recent)
+                    if (!layer_stateless || layer_recent || self.pin_match_retired)
                         && !self.pending_teleports.is_empty()
                     {
                         tracing::debug!(
@@ -1952,6 +1959,10 @@ impl MapWindow {
                         self.pending_teleports.clear();
                     }
                     if !self.pending_teleports.is_empty() {
+                        // One-shot: after processing this arrival (the
+                        // login bootstrap), retire waypoint pin-matching —
+                        // surface teleports must never flip onto floors.
+                        self.pin_match_retired = true;
                         if let Some(pd) = pin_data.as_ref() {
                             if !pd.floors.is_empty() {
                                 let xf = {
@@ -2145,6 +2156,8 @@ impl MapWindow {
                     if let Some(sel) = floor_select {
                         self.active_floor = sel;
                         self.floor_locked = true;
+                        // Manual pick retires the login pin-match.
+                        self.pin_match_retired = true;
                         let target = pin_data.as_ref().and_then(|pd| {
                             sel.and_then(|i| {
                                 pd.floors.get(i)
@@ -2683,54 +2696,14 @@ impl MapWindow {
                         }
                     }
 
-                    // Floor auto-follow: selects the floor whose overlay
-                    // contains the dot; returns to surface once clear.
-                    // Skipped when the position is unclaimed or when the
-                    // user manually locked a floor (their pick wins until
-                    // they return to the surface).
-                    if self.auto_map && !cal_unassigned && !self.floor_locked {
-                        if let Some(pd) = pin_data.as_ref() {
-                            if !pd.floors.is_empty() {
-                                if let Some((x, _, z)) = player {
-                                    let (dx, dy) = xf.apply(md.origin, x, z);
-                                    let (rx, ry) =
-                                        (dx - md.origin.0, dy - md.origin.1);
-                                    // Inside any overlay rect (with margin)?
-                                    let mut best_floor: Option<(f64, usize)> = None;
-                                    for (i, f) in pd.floors.iter().enumerate() {
-                                        let m = 10.0;
-                                        if rx > f.rect.0 + m
-                                            && rx < f.rect.2 - m
-                                            && ry > f.rect.1 + m
-                                            && ry < f.rect.3 - m
-                                        {
-                                            let area = (f.rect.2 - f.rect.0)
-                                                * (f.rect.3 - f.rect.1);
-                                            if best_floor.is_none()
-                                                || area < best_floor
-                                                    .map(|(a, _)| a)
-                                                    .unwrap_or(f64::INFINITY)
-                                            {
-                                                best_floor = Some((area, i));
-                                            }
-                                        }
-                                    }
-                                    match best_floor {
-                                        Some((_, i)) => {
-                                            if self.active_floor != Some(i)
-                                            {
-                                                self.active_floor = Some(i);
-                                            }
-                                        }
-                                        None => {
-                                            // Outside all overlays → surface
-                                            self.active_floor = None;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    // NOTE: no rect-containment floor auto-follow. Floors
+                    // and the surface share one canvas — a 2D rect cannot
+                    // tell "standing on the surface above a floor's area"
+                    // from "on the floor", so it flipped surface positions
+                    // onto floors (e.g. central Temple of Space ground →
+                    // Apathic Interval). Floor authority is exclusively:
+                    // layer packets (5991) → manual picks → the one-shot
+                    // login pin-match below.
                     let mut cal_action: Option<CalAction> = None;
                     let pd_floors = pin_data.as_deref();
                     egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -2988,6 +2961,7 @@ impl MapWindow {
                 self.active_floor = None;
                 self.pending_layer = None;         // layer ids are map-scoped
                 self.active_layer = None;
+                self.pin_match_retired = false;    // fresh bootstrap per map
                 self.floor_locked = false;         // surface locks don't carry over
                 self.floor_overlays.clear();
                 let (off, scale, pts, frame_floors) =
