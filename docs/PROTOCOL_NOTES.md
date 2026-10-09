@@ -266,3 +266,22 @@ Useful only as a login/account fingerprint.
 Two shapes: periodic (field 9 present, 1-2 Hz while inside) and a 2-byte-shorter
 straggler (field 9 absent) sent once on *leaving*. Stragglers must not refresh
 the silence timer (they added ~15 s of lag to map switches before the fix).
+
+### Scene-id region map (complete, 7.1)
+Every separate region is its own scene with local coordinates; `PlayerEnterSceneNotify`
+(9582) field 9 is the authoritative world discriminator:
+
+| scene_id   | region                    | map |
+|------------|---------------------------|-----|
+| 4294906403 | Teyvat                    | 2   |
+| 4294906401 | Enkanomiya                | 7   |
+| 4294906400 | Chasm: Underground Mines | 9   |
+| 4294906411 | Sea of Bygone Eras        | 34  |
+| 4294906497 | Ancient Sacred Mountain   | 36  |
+| 4294906503 | Temple of Space           | 37  |
+| 4294906496 | Frost Moon (moon)         | 40  |
+
+Only the Chasm (LightStone) and the moon (MoonFatigue) broadcast 6771 region
+features; the other four emit nothing — scene ids are their only signal.
+Cross-region canvas geometry is meaningless: e.g. the Chasm mines report small
+local coords like (402, 419, 396), overlapping every other region's canvas box.
