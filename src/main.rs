@@ -6,6 +6,7 @@
 
 mod admin;
 mod capture;
+mod cmd_names;
 mod cookies;
 mod explore;
 mod map;
@@ -323,6 +324,19 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                             last_big_packet = Some(std::time::Instant::now());
                         }
 
+                        // Definitive layer change: _EnterMapLayerReq (5991)
+                        // or _EnterMapLayerRsp (21115) — the actual map
+                        // layer switch signal.
+                        if command.command_id == 5991 || command.command_id == 21115 {
+                            tracing::info!(
+                                "MAP LAYER {} [{}]",
+                                if command.command_id == 5991 { "Req" } else { "Rsp" },
+                                cmd_names::command_name(command.command_id).unwrap_or("?")
+                            );
+                            let _ = tx.send(Msg::SceneChanged);
+                            pos_tracker.reset();
+                        }
+
                         // Named entity notifications — entity type names as
                         // readable strings (spawn/despawn lifecycle).
                         if let Some(ne) = explore::detect_named_entity(command) {
@@ -436,6 +450,7 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                     "n": fullcap_count,
                                     "ts": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                                     "cmd": command.command_id,
+                                    "name": cmd_names::command_name(command.command_id),
                                     "len": command.proto_data.len(),
                                     "hex": hex,
                                 })
