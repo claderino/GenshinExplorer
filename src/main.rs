@@ -466,7 +466,11 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                 let mapped = match scene {
                                     429_4906_403 => Some(2u32),  // Teyvat
                                     429_4906_400 => Some(9u32),  // Chasm mines
-                                    429_4906_496 => Some(40u32), // moon
+                                    429_4906_401 => Some(7u32),  // Enkanomiya
+                                    429_4906_411 => Some(34u32), // Sea of Bygone Eras
+                                    429_4906_496 => Some(40u32), // Frost Moon (moon)
+                                    429_4906_497 => Some(36u32), // Ancient Sacred Mountain
+                                    429_4906_503 => Some(37u32), // Temple of Space
                                     _ => None,
                                 };
                                 if let Some(map_id) = mapped {
