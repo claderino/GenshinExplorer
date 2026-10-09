@@ -499,6 +499,24 @@ impl MapWindow {
         }
     }
 
+    /// Reverse lookup: the layer id a floor is currently mapped to.
+    /// Prefers the shallowest (smallest) id when ambiguous — used to keep
+    /// manual floor selection consistent with the render stack, so
+    /// picking a shallower floor hides the deeper overlays.
+    fn layer_for_floor(
+        learned: &HashMap<u32, HashMap<u64, (u32, u32)>>,
+        map_id: u32,
+        group_id: u32,
+        floor_id: u32,
+    ) -> Option<u64> {
+        learned
+            .get(&map_id)?
+            .iter()
+            .filter(|(_, (g, f))| *g == group_id && *f == floor_id)
+            .map(|(id, _)| *id)
+            .min()
+    }
+
     fn learned_layers_path() -> std::path::PathBuf {
         Self::data_dir().join("learned_map_layers.json")
     }
@@ -1804,6 +1822,25 @@ impl MapWindow {
                             self.active_floor = sel;
                             // Lock whatever was taught — floor or surface.
                             self.floor_locked = true;
+                            // Re-point the active layer to the taught
+                            // floor so the render stack follows it.
+                            let target = sel.and_then(|i| {
+                                pd.as_ref().and_then(|p| {
+                                    p.floors.get(i)
+                                        .map(|f| (f.group_id, f.floor_id))
+                                })
+                            });
+                            self.active_layer = target.and_then(|(g, f)| {
+                                Self::layer_for_floor(
+                                    &self.learned_layers,
+                                    self.selected_map,
+                                    g,
+                                    f,
+                                )
+                            });
+                            if self.active_layer.is_some() {
+                                self.pending_layer = None;
+                            }
                         }
                     }
 
@@ -2053,10 +2090,31 @@ impl MapWindow {
                     // Floor (layer) selection: manual override from the
                     // sidebar combobox — locks out auto-follow (a manual
                     // Surface pick sticks too; rect containment must not
-                    // fight an explicit choice).
+                    // fight an explicit choice). The picked floor also
+                    // RE-POINTS the active layer so the render stack
+                    // follows: picking a shallower floor hides the
+                    // deeper overlays instead of leaving the old layer's
+                    // stack rendered.
                     if let Some(sel) = floor_select {
                         self.active_floor = sel;
                         self.floor_locked = true;
+                        let target = pin_data.as_ref().and_then(|pd| {
+                            sel.and_then(|i| {
+                                pd.floors.get(i)
+                                    .map(|f| (f.group_id, f.floor_id))
+                            })
+                        });
+                        self.active_layer = target.and_then(|(g, f)| {
+                            Self::layer_for_floor(
+                                &self.learned_layers,
+                                self.selected_map,
+                                g,
+                                f,
+                            )
+                        });
+                        if self.active_layer.is_some() {
+                            self.pending_layer = None;
+                        }
                     }
 
                     // ── Floor render stack ──
