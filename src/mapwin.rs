@@ -271,7 +271,7 @@ pub struct MapWindow {
     /// Challenge completions (20234-shape success) at the player position.
     pending_challenges: Vec<(f32, f32)>,
     /// Teleport arrivals — used for floor auto-selection via pin ownership.
-    pending_teleports: Vec<(f32, f32, f32)>,
+    pending_teleports: Vec<(f32, f32, f32, f32)>,
     /// Recent challenge completions (map px) — chests opening near these are
     /// the spawned reward chest, not a pinned chest.
     recent_challenge_done: Vec<(f64, f64, std::time::Instant)>,
@@ -423,12 +423,14 @@ impl MapWindow {
         self.pending_challenges.push((x, z));
     }
 
-    /// Queue a teleport arrival for floor auto-selection.
-    pub fn note_teleport(&mut self, x: f32, y: f32, z: f32) {
+    /// Queue a teleport arrival for floor auto-selection. `dy` is the
+    /// height delta of the jump — stacked-floor teleports are disambiguated
+    /// by it (x-z alone can't tell floor N from floor N+1 above it).
+    pub fn note_teleport(&mut self, x: f32, y: f32, z: f32, dy: f32) {
         if self.pending_teleports.len() >= 20 {
             self.pending_teleports.remove(0);
         }
-        self.pending_teleports.push((x, y, z));
+        self.pending_teleports.push((x, y, z, dy));
     }
 
     /// Packet-driven region switch (6771 broadcast): authoritative —
@@ -1255,19 +1257,21 @@ impl MapWindow {
                                 let events = std::mem::take(
                                     &mut self.pending_teleports,
                                 );
-                                for (tx, ty, tz) in &events {
+                                for (tx, ty, tz, tdy) in &events {
                                     let surface_range =
                                         (-100.0..=1_000.0).contains(ty);
                                     if surface_range {
                                         // ── Strategy 1: same-scene pin match ──
-                                        let (dx, dy) = xf.apply(
+                                        let (cx, cy) = xf.apply(
                                             md.origin, *tx, *tz);
                                         let near = pd.index.query(
-                                            dx - 120.0, dy - 120.0,
-                                            dx + 120.0, dy + 120.0);
-                                        let mut best: Option<
-                                            (f64, &crate::pins::Pin),
-                                        > = None;
+                                            cx - 120.0, cy - 120.0,
+                                            cx + 120.0, cy + 120.0);
+                                        // Nearest floor-owned waypoint per
+                                        // floor — stacked floors can both
+                                        // own pins near the arrival point.
+                                        let mut per_floor: Vec<(f64, usize)>
+                                            = Vec::new();
                                         for idx in near {
                                             let pin = &pd.pins[idx];
                                             // Waypoint pins only — floor
@@ -1276,42 +1280,83 @@ impl MapWindow {
                                             if pin.label_id != 3 {
                                                 continue;
                                             }
-                                            let d = ((pin.x - dx).powi(2)
-                                                + (pin.y - dy).powi(2))
+                                            let d = ((pin.x - cx).powi(2)
+                                                + (pin.y - cy).powi(2))
                                                 .sqrt();
-                                            if d < 120.0
-                                                && best.as_ref()
-                                                    .map(|(bd, _)| {
-                                                        d < *bd
-                                                    })
-                                                    .unwrap_or(true)
-                                            {
-                                                best = Some((d, pin));
+                                            if d >= 120.0 {
+                                                continue;
                                             }
-                                        }
-                                        if let Some((d, pin)) = best {
                                             for (fi, f) in pd.floors
                                                 .iter().enumerate()
                                             {
                                                 if f.point_ids
                                                     .contains(&pin.id)
                                                 {
-                                                    tracing::info!(
-                                                        "teleport pin-match → floor {fi} ({}, pin {} {d:.0}px)",
-                                                        f.name, pin.id
-                                                    );
-                                                    self.active_floor =
-                                                        Some(fi);
-                                                    self.floor_locked =
-                                                        true;
+                                                    if let Some(e) =
+                                                        per_floor
+                                                            .iter_mut()
+                                                            .find(|(_, ef)| {
+                                                                *ef == fi
+                                                            })
+                                                    {
+                                                        if d < e.0 {
+                                                            e.0 = d;
+                                                        }
+                                                    } else {
+                                                        per_floor.push((
+                                                            d, fi,
+                                                        ));
+                                                    }
                                                     break;
                                                 }
                                             }
+                                        }
+                                        per_floor.sort_by(|a, b| {
+                                            a.0.partial_cmp(&b.0)
+                                                .unwrap_or(
+                                                    std::cmp::Ordering::Equal,
+                                                )
+                                        });
+                                        // Stacked-floor disambiguation: a
+                                        // big height jump means a different
+                                        // floor than the one we left — when
+                                        // the nearest match is that same
+                                        // floor and another floor also owns
+                                        // a nearby pin, prefer the other.
+                                        let pick = if *tdy > 250.0 {
+                                            let nearest = per_floor
+                                                .first()
+                                                .map(|(_, f)| *f);
+                                            match self.active_floor {
+                                                Some(prev)
+                                                    if nearest
+                                                        == Some(prev)
+                                                        && per_floor.len()
+                                                            > 1 =>
+                                                {
+                                                    Some(per_floor[1].1)
+                                                }
+                                                _ => nearest,
+                                            }
                                         } else {
-                                            // No floor-owned waypoint near
-                                            // → surface
-                                            self.active_floor = None;
-                                            self.floor_locked = false;
+                                            per_floor.first().map(|(_, f)| *f)
+                                        };
+                                        match pick {
+                                            Some(fi) => {
+                                                tracing::info!(
+                                                    "teleport pin-match → floor {fi} ({}, Δy {tdy:.0})",
+                                                    pd.floors[fi].name
+                                                );
+                                                self.active_floor =
+                                                    Some(fi);
+                                                self.floor_locked = true;
+                                            }
+                                            None => {
+                                                // No floor-owned waypoint
+                                                // near → surface
+                                                self.active_floor = None;
+                                                self.floor_locked = false;
+                                            }
                                         }
                                     } else {
                                         // ── Strategy 2: cross-scene entrance
@@ -1531,8 +1576,9 @@ impl MapWindow {
                     // height sanity for underground maps) stays inside another
                     // map's canvas for 5 s, switch to it. Stands down while a
                     // region broadcast (packets) is authoritative.
+                    // (Gated by 🗺 auto only — 📍 follow is just the camera.)
                     if self.auto_map && self.region_lock.is_none()
-                        && follow && player.is_some()
+                        && player.is_some()
                     {
                         let (px, py, pz) = player.unwrap();
                         let mut candidate: Option<u32> = None;
@@ -2233,9 +2279,23 @@ impl MapWindow {
               center_request: &mut Option<(f64, f64)>,
               auto_map: &mut bool) {
         ui.horizontal(|ui| {
-            ui.checkbox(follow, "📍 follow");
-            ui.checkbox(auto_map, "🗺 auto");
+            ui.checkbox(follow, "📍 follow")
+                .on_hover_text(
+                    "Camera: keep the map view centered on your live position. \
+                     Panning or scrolling turns it off; it also can't do \
+                     anything until a position is received (login first).");
+            ui.checkbox(auto_map, "🗺 auto")
+                .on_hover_text(
+                    "Auto-switch the displayed sub-map and floor: region \
+                     packets (Chasm / Nod-Krai), teleports (waypoint floor \
+                     matching) and position (map bounds).");
             if ui.button("🎯 center").clicked() { *follow = true; *zoom = 1.0; }
+            if *follow && player.is_none() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 190, 90),
+                    "📍 waiting for position…",
+                );
+            }
             ui.separator();
             if ui.button(if *calibrating {"◉ click spot…"} else {"📍+ cal"})
                 .on_hover_text(

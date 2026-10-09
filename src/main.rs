@@ -54,7 +54,7 @@ pub enum Msg {
     SceneChanged,
     /// Teleport arrival — used for floor (layer) auto-selection via
     /// nearest-pin ownership matching.
-    TeleportArrival { x: f32, y: f32, z: f32 },
+    TeleportArrival { x: f32, y: f32, z: f32, dy: f32 },
 }
 
 fn main() -> Result<()> {
@@ -185,7 +185,7 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
             .open(data_dir.join("scenetransitions.jsonl"))?;
         let mut scene_capture_until: Option<std::time::Instant> = None;
         let mut scene_event: u64 = 0;
-        let mut last_sent_pos: Option<(f32, f32)> = None;
+        let mut last_sent_pos: Option<(f32, f32, f32)> = None;
         // Region-feature tracking (6771 broadcasts) → active region map.
         let mut region_feature_at: Option<(String, std::time::Instant)> = None;
         let mut active_region: Option<u32> = None;
@@ -325,18 +325,13 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                             last_big_packet = Some(std::time::Instant::now());
                         }
 
-                        // Definitive layer change: _EnterMapLayerReq (5991)
-                        // or _EnterMapLayerRsp (21115) — the actual map
-                        // layer switch signal.
-                        if command.command_id == 5991 || command.command_id == 21115 {
-                            tracing::info!(
-                                "MAP LAYER {} [{}]",
-                                if command.command_id == 5991 { "Req" } else { "Rsp" },
-                                cmd_names::command_name(command.command_id).unwrap_or("?")
-                            );
-                            let _ = tx.send(Msg::SceneChanged);
-                            pos_tracker.reset();
-                        }
+                        // _EnterMapLayerReq/Rsp (5991/21115): NOT a floor
+                        // switch — captures show they fire alongside
+                        // EnterWorldAreaReq (25407) on every world-area
+                        // border crossing (several per minute while flying).
+                        // The Req carries one config id (field 4, ~1.03e9)
+                        // and the Rsp is always empty. Log only — bumping
+                        // scene_gen here would fragment calibration frames.
 
                         // Named entity notifications — entity type names as
                         // readable strings (spawn/despawn lifecycle).
@@ -676,11 +671,17 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                     first_position_at =
                                         Some(std::time::Instant::now());
                                 }
-                                // Scene-transition capture: a big jump = teleport
-                                // (possibly cross-scene). Log everything for 2.5 s.
-                                if let Some((lx, lz)) = last_sent_pos {
+                                // Teleport: a big x-z jump OR a big height
+                                // jump. Layered teleports (stacked floors)
+                                // can land within a few units in x-z while
+                                // moving hundreds of units in y — the y
+                                // delta is the discriminator. 250 stays
+                                // clear of sustained dive-fall speeds
+                                // between position samples.
+                                if let Some((lx, ly, lz)) = last_sent_pos {
                                     let d = ((px - lx).powi(2) + (pz - lz).powi(2)).sqrt();
-                                    if d > 200.0 {
+                                    let dy = (py - ly).abs();
+                                    if d > 200.0 || dy > 250.0 {
                                         scene_capture_until =
                                             Some(std::time::Instant::now()
                                                 + Duration::from_millis(2500));
@@ -692,7 +693,7 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                         pos_tracker.reset();
                                         let _ = tx.send(
                                             Msg::TeleportArrival {
-                                                x: px, y: py, z: pz,
+                                                x: px, y: py, z: pz, dy,
                                             });
                                         {
                                             use std::io::Write;
@@ -703,17 +704,17 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                                     "event": scene_event,
                                                     "ts": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                                                     "teleport": true,
-                                                    "from": [lx, lz],
+                                                    "from": [lx, ly, lz],
                                                     "to": [px, py, pz],
                                                 })
                                             );
                                         }
                                         let _ = tx.send(Msg::Info(format!(
-                                            "teleport detected ({d:.0} units) — capturing scene packets"
+                                            "teleport detected ({d:.0} units, Δy {dy:.0}) — capturing scene packets"
                                         )));
                                     }
                                 }
-                                last_sent_pos = Some((px, pz));
+                                last_sent_pos = Some((px, py, pz));
                                 let _ = tx.send(Msg::Position { x: px, y: py, z: pz });
                                 {
                                     use std::io::Write;
@@ -987,8 +988,8 @@ impl eframe::App for ExplorerApp {
                 Msg::SceneChanged => {
                     self.map_window.scene_gen += 1;
                 }
-                Msg::TeleportArrival { x, y, z } => {
-                    self.map_window.note_teleport(x, y, z);
+                Msg::TeleportArrival { x, y, z, dy } => {
+                    self.map_window.note_teleport(x, y, z, dy);
                 }
             }
         }
