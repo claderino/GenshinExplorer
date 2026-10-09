@@ -3222,13 +3222,20 @@ impl MapWindow {
         }
 
         // ── Backdrop: stitched low-res overview ──
+        // The base (surface) map dims while a floor layer is active —
+        // like HoYoLab — so the full-brightness floor overlay stands out.
+        let base_tint = if active_floor.is_empty() {
+            egui::Color32::WHITE
+        } else {
+            egui::Color32::from_rgb(150, 150, 150)
+        };
         let map_screen = egui::vec2(
             data.total_size.0 as f32 * *zoom,
             data.total_size.1 as f32 * *zoom);
         painter.image(overview.id(),
             egui::Rect::from_min_size(rect.left_top()+*pan, map_screen),
             egui::Rect::from_min_max(egui::pos2(0.,0.), egui::pos2(1.,1.)),
-            egui::Color32::WHITE);
+            base_tint);
 
         // ── Sharp tiles streamed on demand ──
         let z = ((*zoom as f64).log2().floor() as i32).clamp(data.min_zoom, data.max_zoom);
@@ -3253,7 +3260,7 @@ impl MapWindow {
                     painter.image(tex_id,
                         egui::Rect::from_min_size(min, egui::vec2(tile_screen, tile_screen)),
                         egui::Rect::from_min_max(egui::pos2(0.,0.), egui::pos2(1.,1.)),
-                        egui::Color32::WHITE);
+                        base_tint);
                 }
             }
         }
