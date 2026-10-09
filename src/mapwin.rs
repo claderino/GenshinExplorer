@@ -142,7 +142,12 @@ fn solve_all_frames(
             }
             let suu: f64 = us.iter().map(|a| a * a).sum();
             let sut: f64 = us.iter().zip(&ts).map(|(a, b)| a * b).sum();
-            let sigma = suu.sqrt() / n;
+            // Standard deviation of the (centered) world-side spread —
+            // the scale needs the points to actually span the frame.
+            // NOTE: this was sqrt(suu)/n (RMS with an extra n division),
+            // which made the 150-unit guard reject almost any small
+            // point set and silently keep the builtin scale.
+            let sigma = (suu / n).sqrt();
             if sigma < 150.0 || suu < 1.0e-9 {
                 builtin // not enough within-frame spread
             } else {
