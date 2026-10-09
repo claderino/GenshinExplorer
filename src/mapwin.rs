@@ -1389,6 +1389,7 @@ impl MapWindow {
                         let mut learned = std::mem::take(&mut self.learned_layers);
                         let mut learned_dirty = self.learned_layers_dirty;
                         let cur_layer = self.active_layer;
+                        let cur_floor = self.active_floor;
                         // Some(None) = apply surface, Some(Some(i)) = floor.
                         let mut apply_active: Option<Option<usize>> = None;
                         let pd = pin_data.clone();
@@ -1484,6 +1485,143 @@ impl MapWindow {
                                                     )
                                                 },
                                             );
+                                        }
+                                    }
+                                }
+
+                                // Inferred sibling layers: same stack
+                                // prefix, unlearned — mapped to the
+                                // previous floors of the active floor's
+                                // group (API floors are ordered
+                                // shallow→deep). Picking one teaches it.
+                                let mut inferred: Vec<(u64, usize)> =
+                                    Vec::new();
+                                if let (Some(lid), Some(fi)) =
+                                    (cur_layer, cur_floor)
+                                {
+                                    if fi < pd.floors.len() {
+                                        let floor = &pd.floors[fi];
+                                        let group_floors: Vec<usize> = pd
+                                            .floors
+                                            .iter()
+                                            .enumerate()
+                                            .filter(|(_, f)| {
+                                                f.group_id == floor.group_id
+                                            })
+                                            .map(|(i, _)| i)
+                                            .collect();
+                                        if let Some(pos) = group_floors
+                                            .iter()
+                                            .position(|i| *i == fi)
+                                        {
+                                            let prefix = lid / 100;
+                                            let depth = (lid % 100).max(1)
+                                                as usize;
+                                            for d in 1..depth {
+                                                let sid = prefix * 100 + d as u64;
+                                                let already = learned
+                                                    .get(&selected_map)
+                                                    .map(|m| {
+                                                        m.contains_key(&sid)
+                                                    })
+                                                    .unwrap_or(false);
+                                                if already {
+                                                    continue;
+                                                }
+                                                let off = depth - d;
+                                                if pos >= off {
+                                                    if let Some(&tfi) =
+                                                        group_floors
+                                                            .get(pos - off)
+                                                    {
+                                                        inferred
+                                                            .push((sid, tfi));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if !inferred.is_empty() {
+                                    ui.separator();
+                                    ui.weak(
+                                        "~ inferred siblings (unvisited, \
+                                         guessed from floor-group order):",
+                                    );
+                                    for (sid, tfi) in inferred {
+                                        let fl = &pd.floors[tfi];
+                                        let mut pick: Option<(u32, u32)> =
+                                            None;
+                                        ui.horizontal(|ui| {
+                                            ui.label("~");
+                                            ui.monospace(sid.to_string());
+                                            egui::ComboBox::from_id_salt(
+                                                format!("layer_inf_{sid}"),
+                                            )
+                                            .selected_text(format!(
+                                                "{}: {}",
+                                                fl.group_name, fl.name
+                                            ))
+                                            .width(250.0)
+                                            .show_ui(ui, |ui| {
+                                                if ui
+                                                    .selectable_label(
+                                                        true,
+                                                        format!(
+                                                            "{}: {}",
+                                                            fl.group_name,
+                                                            fl.name
+                                                        ),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    pick = Some((
+                                                        fl.group_id,
+                                                        fl.floor_id,
+                                                    ));
+                                                }
+                                                if ui
+                                                    .selectable_label(
+                                                        false,
+                                                        "Surface (no floor)",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    pick = Some((0, 0));
+                                                }
+                                                for f2 in &pd.floors {
+                                                    if f2.group_id
+                                                        == fl.group_id
+                                                        && f2.floor_id
+                                                            == fl.floor_id
+                                                    {
+                                                        continue;
+                                                    }
+                                                    if ui
+                                                        .selectable_label(
+                                                            false,
+                                                            format!(
+                                                                "{}: {}",
+                                                                f2.group_name,
+                                                                f2.name
+                                                            ),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        pick = Some((
+                                                            f2.group_id,
+                                                            f2.floor_id,
+                                                        ));
+                                                    }
+                                                }
+                                            });
+                                        });
+                                        if let Some((ng, nf)) = pick {
+                                            learned
+                                                .entry(selected_map)
+                                                .or_default()
+                                                .insert(sid, (ng, nf));
+                                            learned_dirty = true;
                                         }
                                     }
                                 }
@@ -1940,6 +2078,60 @@ impl MapWindow {
                                                 fi,
                                                 d != depth,
                                             ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Inferred siblings: unlearned shallower layer ids
+                        // mapped to the previous floors of the active
+                        // floor's group (API floors are ordered
+                        // shallow→deep within a group, and stack layer
+                        // ids share a prefix).
+                        if let Some(layer_id) = self.active_layer {
+                            if let Some(fi) = self.active_floor {
+                                let floor = &pd.floors[fi];
+                                let group_floors: Vec<usize> = pd
+                                    .floors
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, f)| {
+                                        f.group_id == floor.group_id
+                                    })
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                if let Some(pos) = group_floors
+                                    .iter()
+                                    .position(|i| *i == fi)
+                                {
+                                    let prefix = layer_id / 100;
+                                    let depth =
+                                        (layer_id % 100).max(1) as usize;
+                                    for d in 1..depth {
+                                        let sid = prefix * 100 + d as u64;
+                                        let already = self
+                                            .learned_layers
+                                            .get(&self.selected_map)
+                                            .map(|m| {
+                                                m.contains_key(&sid)
+                                            })
+                                            .unwrap_or(false);
+                                        if already {
+                                            continue;
+                                        }
+                                        let off = depth - d;
+                                        if pos >= off {
+                                            if let Some(&tfi) =
+                                                group_floors.get(pos - off)
+                                            {
+                                                if !floor_stack.iter().any(
+                                                    |(i, _)| *i == tfi,
+                                                ) {
+                                                    floor_stack.push((
+                                                        tfi, true,
+                                                    ));
+                                                }
+                                            }
                                         }
                                     }
                                 }
