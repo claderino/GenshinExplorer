@@ -292,6 +292,11 @@ pub struct MapWindow {
     /// Resolved via the learned mapping, or learned from geometry when
     /// the position enters a floor overlay.
     pending_layer: Option<u64>,
+    /// The layer id most recently applied (for the mapping manager UI
+    /// and manual fix-ups).
+    active_layer: Option<u64>,
+    /// Layer-mapping manager window open.
+    layers_open: bool,
     /// Learned map-layer id → floor identity (group_id, floor_id),
     /// persisted per map in `learned_map_layers.json`.
     learned_layers: std::collections::HashMap<u32, std::collections::HashMap<u64, (u32, u32)>>,
@@ -395,6 +400,8 @@ impl MapWindow {
             pending_region: None,
             region_lock: None,
             pending_layer: None,
+            active_layer: None,
+            layers_open: false,
             learned_layers: Self::load_learned_layers(),
             learned_layers_dirty: false,
             sync_job: None,
@@ -464,6 +471,7 @@ impl MapWindow {
         match layer_id {
             None => {
                 self.pending_layer = None;
+                self.active_layer = None;
                 self.active_floor = None;
                 self.floor_locked = false;
             }
@@ -1034,6 +1042,13 @@ impl MapWindow {
                     let mut label_search = std::mem::take(&mut self.label_search);
                     let mut floor_select: Option<Option<usize>> = None;
                     let mut floor_pick = self.active_floor;
+                    // Layer-mapping manager state (locals to keep the
+                    // closures free of `self` borrows).
+                    let mut layers_open = self.layers_open;
+                    let mut learned = std::mem::take(&mut self.learned_layers);
+                    let mut learned_dirty = self.learned_layers_dirty;
+                    let cur_layer = self.active_layer;
+                    let mut apply_active_floor: Option<usize> = None;
                     egui::SidePanel::left("map_filters")
                         .resizable(true).default_width(230.0).min_width(200.0)
                         .show_inside(ui, |ui| {
@@ -1276,6 +1291,15 @@ impl MapWindow {
                                     if floor_pick != self.active_floor {
                                         floor_select = Some(floor_pick);
                                     }
+                                    if ui.button("🗂")
+                                        .on_hover_text(
+                                            "Learned minimap-layer → floor mappings: \
+                                             fix a wrong entry or forget one (it will \
+                                             re-learn on your next visit).")
+                                        .clicked()
+                                    {
+                                        layers_open = true;
+                                    }
                                 }
                             }
                             ui.separator();
@@ -1296,6 +1320,180 @@ impl MapWindow {
                     self.sync_detected = sync_detected;
                     self.sync_detected_idx = sync_detected_idx;
                     self.detect_job = detect_job;
+                    self.layers_open = layers_open;
+                    self.learned_layers = learned;
+                    self.learned_layers_dirty = learned_dirty;
+                    if let Some(i) = apply_active_floor {
+                        self.active_floor = Some(i);
+                    }
+
+                    // ── Layer-mapping manager window ──
+                    if self.layers_open {
+                        let mut layers_open = self.layers_open;
+                        let mut learned = std::mem::take(&mut self.learned_layers);
+                        let mut learned_dirty = self.learned_layers_dirty;
+                        let cur_layer = self.active_layer;
+                        let mut apply_active_floor: Option<usize> = None;
+                        let pd = pin_data.clone();
+                        egui::Window::new("🗂 Layer mappings")
+                            .open(&mut layers_open)
+                            .resizable(true)
+                            .default_width(460.0)
+                            .show(ui.ctx(), |ui| {
+                                let Some(pd) = pd.as_deref() else {
+                                    ui.label("Pins not loaded yet.");
+                                    return;
+                                };
+                                ui.label(format!(
+                                    "Minimap-layer → floor (map {selected_map})"));
+                                ui.small(format!(
+                                    "active layer: {}",
+                                    cur_layer.map(|l| l.to_string())
+                                        .unwrap_or_else(|| "—".into())));
+                                ui.small(
+                                    "Entries are learned automatically as you \
+                                     play. Fix a wrong floor here, or ✕ to \
+                                     re-learn it on your next visit.",
+                                );
+                                ui.add_space(4.0);
+                                let entries: Vec<u64> = learned
+                                    .get(&selected_map)
+                                    .map(|m| {
+                                        let mut ks: Vec<u64> =
+                                            m.keys().copied().collect();
+                                        ks.sort_unstable();
+                                        ks
+                                    })
+                                    .unwrap_or_default();
+                                if entries.is_empty() {
+                                    ui.weak("(nothing learned on this map yet)");
+                                }
+                                egui::ScrollArea::vertical()
+                                    .max_height(340.0)
+                                    .show(ui, |ui| {
+                                        for id in entries {
+                                            let (g, f) = *learned
+                                                .get(&selected_map)
+                                                .and_then(|m| m.get(&id))
+                                                .unwrap_or(&(0, 0));
+                                            let cur_text = pd
+                                                .floors
+                                                .iter()
+                                                .find(|fl| {
+                                                    fl.group_id == g
+                                                        && fl.floor_id == f
+                                                })
+                                                .map(|fl| {
+                                                    format!(
+                                                        "{}: {}",
+                                                        fl.group_name, fl.name
+                                                    )
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    format!(
+                                                        "group {g} / floor {f} \
+                         (missing from API)"
+                                                    )
+                                                });
+                                            let mut pick: Option<(u32, u32)> =
+                                                None;
+                                            let mut del = false;
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    if cur_layer == Some(id) {
+                                                        "📍"
+                                                    } else {
+                                                        "  "
+                                                    },
+                                                );
+                                                ui.monospace(id.to_string());
+                                                egui::ComboBox::from_id_salt(
+                                                    format!("layer_fix_{id}"),
+                                                )
+                                                .selected_text(cur_text)
+                                                .width(250.0)
+                                                .show_ui(ui, |ui| {
+                                                    for fl in &pd.floors {
+                                                        let selected =
+                                                            fl.group_id == g
+                                                                && fl.floor_id
+                                                                    == f;
+                                                        if ui
+                                                            .selectable_label(
+                                                                selected,
+                                                                format!(
+                                                                    "{}: {}",
+                                                                    fl.group_name,
+                                                                    fl.name
+                                                                ),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            pick = Some((
+                                                                fl.group_id,
+                                                                fl.floor_id,
+                                                            ));
+                                                        }
+                                                    }
+                                                });
+                                                if ui
+                                                    .button("✕")
+                                                    .on_hover_text(
+                                                        "forget this layer",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    del = true;
+                                                }
+                                            });
+                                            if let Some((ng, nf)) = pick {
+                                                if let Some(m) = learned
+                                                    .get_mut(&selected_map)
+                                                {
+                                                    m.insert(id, (ng, nf));
+                                                }
+                                                learned_dirty = true;
+                                                if cur_layer == Some(id) {
+                                                    if let Some(i) = pd
+                                                        .floors
+                                                        .iter()
+                                                        .position(|fl| {
+                                                            fl.group_id == ng
+                                                                && fl.floor_id
+                                                                    == nf
+                                                        })
+                                                    {
+                                                        apply_active_floor =
+                                                            Some(i);
+                                                    }
+                                                }
+                                            }
+                                            if del {
+                                                if let Some(m) = learned
+                                                    .get_mut(&selected_map)
+                                                {
+                                                    m.remove(&id);
+                                                }
+                                                learned_dirty = true;
+                                            }
+                                        }
+                                    });
+                                ui.separator();
+                                if ui
+                                    .button("🗑 Forget all on this map")
+                                    .clicked()
+                                {
+                                    learned.remove(&selected_map);
+                                    learned_dirty = true;
+                                }
+                            });
+                        self.layers_open = layers_open;
+                        self.learned_layers = learned;
+                        self.learned_layers_dirty = learned_dirty;
+                        if let Some(i) = apply_active_floor {
+                            self.active_floor = Some(i);
+                        }
+                    }
 
                     // 🧲 job result: browser sessions expanded per character.
                     if let Some(job) = self.detect_job.clone() {
@@ -1954,6 +2152,7 @@ impl MapWindow {
                                     self.active_floor = Some(fi);
                                     self.floor_locked = true;
                                     self.pending_layer = None;
+                                    self.active_layer = Some(layer_id);
                                 }
                             } else {
                                 // Flat map — nothing to resolve.
