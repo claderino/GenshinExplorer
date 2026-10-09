@@ -25,9 +25,12 @@ Desktop.ini
 # Environment / secrets (never commit)
 .env
 .env.*
-*.pem
 *.key
 credentials*.json
+
+# Dispatch keys — game-client-derived PUBLIC protocol keys (same
+# category as keys/gi.json), required by the vendored sniffer.
+!vendor/auto-artifactarium/keys/*.pem
 
 # HoYoLab cookie profiles (DPAPI-encrypted, per-machine)
 hoyolab_profiles.json
