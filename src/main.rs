@@ -55,6 +55,9 @@ pub enum Msg {
     /// Teleport arrival — used for floor (layer) auto-selection via
     /// nearest-pin ownership matching.
     TeleportArrival { x: f32, y: f32, z: f32, dy: f32 },
+    /// Minimap layer entry (5991 _EnterMapLayerReq) — the definitive
+    /// floor signal. `None` = default (base) layer.
+    MapLayer { layer_id: Option<u64> },
 }
 
 fn main() -> Result<()> {
@@ -325,13 +328,23 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                             last_big_packet = Some(std::time::Instant::now());
                         }
 
-                        // _EnterMapLayerReq/Rsp (5991/21115): NOT a floor
-                        // switch — captures show they fire alongside
-                        // EnterWorldAreaReq (25407) on every world-area
-                        // border crossing (several per minute while flying).
-                        // The Req carries one config id (field 4, ~1.03e9)
-                        // and the Rsp is always empty. Log only — bumping
-                        // scene_gen here would fragment calibration frames.
+                        // _EnterMapLayerReq/Rsp (5991/21115): the client
+                        // reports the map layer the minimap switched to
+                        // when crossing a world-area boundary. The Req
+                        // payload is `{4: map_layer_id}` (empty = default
+                        // layer) — the definitive floor signal. The Rsp
+                        // is a bare retcode and carries nothing.
+                        if command.command_id == 5991 {
+                            if let Some(layer_id) =
+                                explore::detect_map_layer(&command.proto_data)
+                            {
+                                tracing::debug!(
+                                    "map layer → {layer_id:?}"
+                                );
+                                let _ =
+                                    tx.send(Msg::MapLayer { layer_id });
+                            }
+                        }
 
                         // Named entity notifications — entity type names as
                         // readable strings (spawn/despawn lifecycle).
@@ -990,6 +1003,9 @@ impl eframe::App for ExplorerApp {
                 }
                 Msg::TeleportArrival { x, y, z, dy } => {
                     self.map_window.note_teleport(x, y, z, dy);
+                }
+                Msg::MapLayer { layer_id } => {
+                    self.map_window.note_map_layer(layer_id);
                 }
             }
         }

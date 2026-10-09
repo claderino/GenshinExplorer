@@ -409,6 +409,33 @@ pub fn detect_challenge_result(cmd: &GameCommand) -> Option<ChallengeResult> {
     }
 }
 
+/// Map-layer entry (cmd 5991 = _EnterMapLayerReq): `{4: map_layer_id}` —
+/// sent by the client whenever the minimap switches to a named layer
+/// (moon districts, underground floors). Observed ids are structured:
+/// `1029_00NN_0M` = area NN, sub-layer M (e.g. 1029000601 → 1029000602
+/// when descending a floor within area 6). An EMPTY payload means the
+/// default/base layer (outdoors).
+///
+/// Returns `Some(None)` for the default layer, `Some(Some(id))` for a
+/// named layer, `None` when the buffer is not a map-layer message.
+pub fn detect_map_layer(buf: &[u8]) -> Option<Option<u64>> {
+    if buf.is_empty() {
+        return Some(None);
+    }
+    if buf.len() > 8 {
+        return None;
+    }
+    let fields = parse(buf)?;
+    let mut id = None;
+    for (f, v) in &fields {
+        if *f == 4 {
+            id = v.as_varint();
+        }
+    }
+    // Only a well-formed single-field message counts.
+    id.map(Some)
+}
+
 /// Region-feature broadcast (cmd 6771 = RegionalPlayInfoNotify):
 /// `{3: 1, 9: 1, 10: "<name>", 12: rule_id, …}` repeating ~1–2 Hz while
 /// inside special regions.
@@ -663,6 +690,28 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    /// Real captured _EnterMapLayerReq with a named layer (moon area 9).
+    #[test]
+    fn detects_map_layer_named() {
+        // {4: 1029000901}
+        assert_eq!(
+            detect_map_layer(&hex("20c59dd5ea03")),
+            Some(Some(1029000901))
+        );
+        // {4: 1029001002} — area 10, layer 2
+        assert_eq!(
+            detect_map_layer(&hex("20aa9ed5ea03")),
+            Some(Some(1029001002))
+        );
+    }
+
+    /// Real captured _EnterMapLayerReq with an empty payload — the
+    /// default (base) layer.
+    #[test]
+    fn detects_map_layer_default() {
+        assert_eq!(detect_map_layer(&[]), Some(None));
     }
 
     /// Real captured oculus state change: cmd 652 with config 107001.

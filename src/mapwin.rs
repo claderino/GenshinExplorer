@@ -288,6 +288,15 @@ pub struct MapWindow {
     /// While a region broadcast is active (non-Teyvat), geometric
     /// auto-switching stands down — packets outrank canvas guessing.
     region_lock: Option<u32>,
+    /// Minimap layer report (5991) awaiting resolution to a floor.
+    /// Resolved via the learned mapping, or learned from geometry when
+    /// the position enters a floor overlay.
+    pending_layer: Option<u64>,
+    /// Learned map-layer id → floor identity (group_id, floor_id),
+    /// persisted per map in `learned_map_layers.json`.
+    learned_layers: std::collections::HashMap<u32, std::collections::HashMap<u64, (u32, u32)>>,
+    /// Dirty flag for the learned-layers save.
+    learned_layers_dirty: bool,
     // ── HoYoLab import ──
     sync_open: bool,
     sync_cookie: String,
@@ -385,6 +394,9 @@ impl MapWindow {
             auto_switch_pending: None,
             pending_region: None,
             region_lock: None,
+            pending_layer: None,
+            learned_layers: Self::load_learned_layers(),
+            learned_layers_dirty: false,
             sync_job: None,
             export_job: None,
             pos_history: Vec::new(),
@@ -442,6 +454,89 @@ impl MapWindow {
             tracing::info!("region broadcast → switching to map {map_id}");
             self.pending_region = Some(map_id);
         }
+    }
+
+    /// Minimap layer report (5991 _EnterMapLayerReq). `None` = the client
+    /// returned to the default (base) layer — clear the floor. A named
+    /// layer is applied from the learned mapping immediately, or queued
+    /// for geometry-based learning when unknown.
+    pub fn note_map_layer(&mut self, layer_id: Option<u64>) {
+        match layer_id {
+            None => {
+                self.pending_layer = None;
+                self.active_floor = None;
+                self.floor_locked = false;
+            }
+            Some(id) => self.pending_layer = Some(id),
+        }
+    }
+
+    fn learned_layers_path() -> std::path::PathBuf {
+        Self::data_dir().join("learned_map_layers.json")
+    }
+
+    fn load_learned_layers(
+    ) -> std::collections::HashMap<
+        u32,
+        std::collections::HashMap<u64, (u32, u32)>,
+    > {
+        let Ok(text) = std::fs::read_to_string(Self::learned_layers_path())
+        else {
+            return std::collections::HashMap::new();
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return std::collections::HashMap::new();
+        };
+        let mut out = std::collections::HashMap::new();
+        if let Some(maps) = v.as_object() {
+            for (map_str, entries) in maps {
+                let Ok(map_id) = map_str.parse::<u32>() else { continue };
+                let Some(obj) = entries.as_object() else { continue };
+                let mut inner = std::collections::HashMap::new();
+                for (id_str, pair) in obj {
+                    let Ok(id) = id_str.parse::<u64>() else { continue };
+                    if let Some(arr) = pair.as_array() {
+                        if arr.len() == 2 {
+                            if let (Some(g), Some(f)) =
+                                (arr[0].as_u64(), arr[1].as_u64())
+                            {
+                                inner.insert(id, (g as u32, f as u32));
+                            }
+                        }
+                    }
+                }
+                out.insert(map_id, inner);
+            }
+        }
+        out
+    }
+
+    fn save_learned_layers(&self) {
+        Self::write_learned_layers(&self.learned_layers);
+    }
+
+    fn write_learned_layers(
+        map: &std::collections::HashMap<
+            u32,
+            std::collections::HashMap<u64, (u32, u32)>,
+        >,
+    ) {
+        let mut v = serde_json::Map::new();
+        for (map_id, entries) in map {
+            let mut inner = serde_json::Map::new();
+            for (id, (g, f)) in entries {
+                inner.insert(id.to_string(), serde_json::json!([g, f]));
+            }
+            v.insert(
+                map_id.to_string(),
+                serde_json::Value::Object(inner),
+            );
+        }
+        let _ = std::fs::write(
+            Self::learned_layers_path(),
+            serde_json::to_string_pretty(&serde_json::Value::Object(v))
+                .unwrap_or_default(),
+        );
     }
 
     fn data_dir() -> std::path::PathBuf {
@@ -1763,6 +1858,110 @@ impl MapWindow {
                     }
                     let cal_info = (total_pts, frame_res, cal_unassigned);
 
+                    // Resolve a pending map-layer report (5991): the
+                    // learned mapping switches instantly; an unknown id is
+                    // learned from geometry once the position enters a
+                    // floor overlay (smallest containing rect wins).
+                    if let Some(layer_id) = self.pending_layer {
+                        if let Some(pd) = pin_data.as_ref() {
+                            if !pd.floors.is_empty() {
+                                let known = self
+                                    .learned_layers
+                                    .get(&self.selected_map)
+                                    .and_then(|m| m.get(&layer_id))
+                                    .copied();
+                                let resolved: Option<usize> =
+                                    match known {
+                                        Some((gid, fid)) => {
+                                            pd.floors.iter().position(
+                                                |f| {
+                                                    f.group_id == gid
+                                                        && f.floor_id == fid
+                                                },
+                                            )
+                                        }
+                                        None => {
+                                            if let Some((x, _, z)) = player {
+                                                let (dx, dy) =
+                                                    xf.apply(md.origin, x, z);
+                                                let (rx, ry) = (
+                                                    dx - md.origin.0,
+                                                    dy - md.origin.1,
+                                                );
+                                                let mut best: Option<(
+                                                    f64,
+                                                    usize,
+                                                )> = None;
+                                                for (i, f) in pd
+                                                    .floors
+                                                    .iter()
+                                                    .enumerate()
+                                                {
+                                                    let m = 10.0;
+                                                    if rx > f.rect.0 + m
+                                                        && rx < f.rect.2 - m
+                                                        && ry > f.rect.1 + m
+                                                        && ry < f.rect.3 - m
+                                                    {
+                                                        let area = (f.rect.2
+                                                            - f.rect.0)
+                                                            * (f.rect.3
+                                                                - f.rect.1);
+                                                        if best.is_none()
+                                                            || area
+                                                                < best
+                                                                    .unwrap()
+                                                                    .0
+                                                        {
+                                                            best = Some((
+                                                                area, i,
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                                if let Some((_, i)) = best {
+                                                    // Learn: layer id →
+                                                    // (group, floor).
+                                                    self.learned_layers
+                                                        .entry(
+                                                            self
+                                                                .selected_map,
+                                                        )
+                                                        .or_default()
+                                                        .insert(
+                                                            layer_id,
+                                                            (
+                                                                pd.floors[i]
+                                                                    .group_id,
+                                                                pd.floors[i]
+                                                                    .floor_id,
+                                                            ),
+                                                        );
+                                                    self.learned_layers_dirty =
+                                                        true;
+                                                }
+                                                best.map(|(_, i)| i)
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                    };
+                                if let Some(fi) = resolved {
+                                    tracing::info!(
+                                        "map layer {layer_id} → floor {fi} ({})",
+                                        pd.floors[fi].name
+                                    );
+                                    self.active_floor = Some(fi);
+                                    self.floor_locked = true;
+                                    self.pending_layer = None;
+                                }
+                            } else {
+                                // Flat map — nothing to resolve.
+                                self.pending_layer = None;
+                            }
+                        }
+                    }
+
                     // Floor auto-follow: selects the floor whose overlay
                     // contains the dot; returns to surface once clear.
                     // Skipped when the position is unclaimed or when the
@@ -1970,6 +2169,13 @@ impl MapWindow {
         self.selected = selected;
 
         self.pan=pan; self.zoom=zoom; self.follow=follow; self.calibrating=calibrating;
+        // Persist learned layer-id → floor mappings (deferred from the
+        // state match, which holds a mutable borrow).
+        if self.learned_layers_dirty {
+            let snapshot = self.learned_layers.clone();
+            Self::write_learned_layers(&snapshot);
+            self.learned_layers_dirty = false;
+        }
         self.view_init=view_init;
         if filter_changed { self.pin_filter=pin_filter; self.pin_filter.save(&Self::data_dir(), self.bucket(), selected_map); }
 
@@ -1996,6 +2202,7 @@ impl MapWindow {
                 self.tiles = None;                 // drop texture LRU
                 self.selected = None;              // close popup
                 self.active_floor = None;
+                self.pending_layer = None;         // layer ids are map-scoped
                 self.floor_overlays.clear();
                 let (off, scale, pts) = Self::load_calibration(id);
                 self.calibrate_offset = off;
