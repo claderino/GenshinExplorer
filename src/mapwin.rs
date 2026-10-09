@@ -292,6 +292,11 @@ pub struct MapWindow {
     /// Resolved via the learned mapping, or learned from geometry when
     /// the position enters a floor overlay.
     pending_layer: Option<u64>,
+    /// When the last packet-driven layer decision happened (floor set or
+    /// surface lock) — teleport pin-matching stands down for a short
+    /// window after, since both fire around the same transition and the
+    /// layer packet outranks the pin heuristic.
+    layer_authoritative_at: Option<std::time::Instant>,
     /// The layer id most recently applied (for the mapping manager UI
     /// and manual fix-ups).
     active_layer: Option<u64>,
@@ -400,6 +405,7 @@ impl MapWindow {
             pending_region: None,
             region_lock: None,
             pending_layer: None,
+            layer_authoritative_at: None,
             active_layer: None,
             layers_open: false,
             learned_layers: Self::load_learned_layers(),
@@ -479,6 +485,8 @@ impl MapWindow {
                 // we just left — the layer boundary sits INSIDE the
                 // overlay rect, so containment still matches at exit.
                 self.floor_locked = true;
+                self.layer_authoritative_at =
+                    Some(std::time::Instant::now());
             }
             Some(id) => {
                 self.pending_layer = Some(id);
@@ -1634,6 +1642,27 @@ impl MapWindow {
                     //    the surface transform produces garbage canvas coords,
                     //    so use the PREVIOUS surface position instead — find
                     //    the floor whose entrance pin was nearest.
+                    //
+                    // Layer packets (5991) OUTRANK these heuristics: both fire
+                    // around the same transition, but the position sample
+                    // lags the layer packet by up to a few seconds — without
+                    // this guard the pin-match would overwrite the layer
+                    // decision right after it lands (and its no-match path
+                    // would unlock a fresh surface lock).
+                    let layer_recent = self
+                        .layer_authoritative_at
+                        .map(|t| {
+                            t.elapsed()
+                                < std::time::Duration::from_secs(10)
+                        })
+                        .unwrap_or(false);
+                    if layer_recent && !self.pending_teleports.is_empty() {
+                        tracing::debug!(
+                            "teleport floor-match skipped — layer packet \
+                             decided within the last 10 s"
+                        );
+                        self.pending_teleports.clear();
+                    }
                     if !self.pending_teleports.is_empty() {
                         if let Some(pd) = pin_data.as_ref() {
                             if !pd.floors.is_empty() {
@@ -2263,6 +2292,8 @@ impl MapWindow {
                                     // outranks rect containment.
                                     self.floor_locked = true;
                                     self.pending_layer = None;
+                                    self.layer_authoritative_at =
+                                        Some(std::time::Instant::now());
                                 } else if let Some(fi) = resolved {
                                     tracing::info!(
                                         "map layer {layer_id} → floor {fi} ({})",
@@ -2272,6 +2303,8 @@ impl MapWindow {
                                     self.floor_locked = true;
                                     self.pending_layer = None;
                                     self.active_layer = Some(layer_id);
+                                    self.layer_authoritative_at =
+                                        Some(std::time::Instant::now());
                                 }
                             } else {
                                 // Flat map — nothing to resolve.
