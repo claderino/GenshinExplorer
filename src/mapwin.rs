@@ -501,6 +501,48 @@ impl MapWindow {
         Self::data_dir().join("learned_map_layers.json")
     }
 
+    /// Download (once) / load / cache a floor overlay texture. Returns the
+    /// texture id when available.
+    fn ensure_floor_overlay(
+        overlays: &mut HashMap<u32, egui::TextureHandle>,
+        floor: &pins::FloorInfo,
+        ctx: &egui::Context,
+    ) -> Option<egui::TextureId> {
+        if !overlays.contains_key(&floor.floor_id) {
+            let path = Self::data_dir().join("map").join(format!(
+                "floor_{}.png",
+                floor.floor_id
+            ));
+            if !path.exists() {
+                let agent = ureq::AgentBuilder::new()
+                    .user_agent("Mozilla/5.0")
+                    .build();
+                if let Ok(resp) = agent.get(&floor.overlay_url).call() {
+                    use std::io::Read as _;
+                    let mut buf = Vec::new();
+                    let mut r = resp.into_reader();
+                    if r.read_to_end(&mut buf).is_ok() {
+                        let _ = std::fs::write(&path, &buf);
+                    }
+                }
+            }
+            if let Ok(img) = image::open(&path) {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let tex = ctx.load_texture(
+                    format!("floor_{}", floor.floor_id),
+                    egui::ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        &rgba,
+                    ),
+                    egui::TextureOptions::LINEAR,
+                );
+                overlays.insert(floor.floor_id, tex);
+            }
+        }
+        overlays.get(&floor.floor_id).map(|t| t.id())
+    }
+
     fn load_learned_layers(
     ) -> std::collections::HashMap<
         u32,
@@ -1855,57 +1897,83 @@ impl MapWindow {
                         self.floor_locked = true;
                     }
 
-                    // Lazy-load the active floor's overlay texture.
-                    let mut active_floor_render: Option<(
-                        &pins::FloorInfo,
-                        Option<egui::TextureId>,
-                    )> = None;
-                    if let Some(fi) = self.active_floor {
-                        if let Some(pd) = pin_data.as_ref() {
-                            if let Some(floor) = pd.floors.get(fi) {
-                                if !self.floor_overlays
-                                    .contains_key(&floor.floor_id)
-                                {
-                                    let path = Self::data_dir()
-                                        .join("map")
-                                        .join(format!(
-                                            "floor_{}.png",
-                                            floor.floor_id
-                                        ));
-                                    if !path.exists() {
-                                        let agent = ureq::AgentBuilder::new()
-                                            .user_agent("Mozilla/5.0")
-                                            .build();
-                                        if let Ok(resp) =
-                                            agent.get(&floor.overlay_url).call()
+                    // ── Floor render stack ──
+                    // The in-game map shows every layer from the surface
+                    // down to the current depth — shallower ones dimmed.
+                    // Stacked layer ids differ only in their last two
+                    // digits (…0M = depth M), so each shallower member is
+                    // prefix·100 + d for d in 1..=depth, resolved through
+                    // the learned table. The active floor always renders
+                    // undimmed; without a layer id (teleport / manual
+                    // selection) the bare active floor is the stack.
+                    let mut floor_stack: Vec<(usize, bool)> =
+                        Vec::new(); // (floor idx, dimmed)
+                    if let Some(pd) = pin_data.as_ref() {
+                        if let Some(layer_id) = self.active_layer {
+                            let prefix = layer_id / 100;
+                            let depth = (layer_id % 100).max(1);
+                            for d in 1..=depth {
+                                let lid = prefix * 100 + d;
+                                let target = self
+                                    .learned_layers
+                                    .get(&self.selected_map)
+                                    .and_then(|m| m.get(&lid))
+                                    .copied();
+                                if let Some((g, f)) = target {
+                                    // Surface entries aren't floors.
+                                    if (g, f) == (0, 0) {
+                                        continue;
+                                    }
+                                    if let Some(fi) = pd
+                                        .floors
+                                        .iter()
+                                        .position(|fl| {
+                                            fl.group_id == g
+                                                && fl.floor_id == f
+                                        })
+                                    {
+                                        if !floor_stack
+                                            .iter()
+                                            .any(|(i, _)| *i == fi)
                                         {
-                                            use std::io::Read as _;
-                                            let mut buf = Vec::new();
-                                            let mut r = resp.into_reader();
-                                            if r.read_to_end(&mut buf).is_ok() {
-                                                let _ =
-                                                    std::fs::write(&path, &buf);
-                                            }
+                                            floor_stack.push((
+                                                fi,
+                                                d != depth,
+                                            ));
                                         }
                                     }
-                                    if let Ok(img) = image::open(&path) {
-                                        let rgba = img.to_rgba8();
-                                        let (w, h) = rgba.dimensions();
-                                        let tex = ui.ctx().load_texture(
-                                            format!("floor_{}", floor.floor_id),
-                                            egui::ColorImage::from_rgba_unmultiplied(
-                                                [w as usize, h as usize], &rgba),
-                                            egui::TextureOptions::LINEAR,
-                                        );
-                                        self.floor_overlays
-                                            .insert(floor.floor_id, tex);
-                                    }
                                 }
-                                let tex_id = self
-                                    .floor_overlays
-                                    .get(&floor.floor_id)
-                                    .map(|t| t.id());
-                                active_floor_render = Some((floor, tex_id));
+                            }
+                        }
+                        // The active floor is never dimmed; if it isn't in
+                        // the learned stack yet (partial learning), append
+                        // it — the deepest layer draws last (on top).
+                        if let Some(fi) = self.active_floor {
+                            if let Some(entry) = floor_stack
+                                .iter_mut()
+                                .find(|(i, _)| *i == fi)
+                            {
+                                entry.1 = false;
+                            } else {
+                                floor_stack.push((fi, false));
+                            }
+                        }
+                    }
+                    let mut floor_stack_render: Vec<(
+                        &pins::FloorInfo,
+                        Option<egui::TextureId>,
+                        bool,
+                    )> = Vec::new();
+                    if let Some(pd) = pin_data.as_ref() {
+                        for (fi, dimmed) in &floor_stack {
+                            if let Some(floor) = pd.floors.get(*fi) {
+                                let tex_id = Self::ensure_floor_overlay(
+                                    &mut self.floor_overlays,
+                                    floor,
+                                    ui.ctx(),
+                                );
+                                floor_stack_render
+                                    .push((floor, tex_id, *dimmed));
                             }
                         }
                     }
@@ -2372,7 +2440,7 @@ impl MapWindow {
                             &mut pan, &mut zoom, &mut follow, &mut calibrating,
                             &mut view_init, xf, cal_info, &mut cal_action,
                             pin_data.as_deref(), &pin_filter, &icon_textures,
-                            active_floor_render,
+                            &floor_stack_render,
                             &completed, &mut selected, &auto_notes,
                             &mut quick_toggle, &mut center_request, &mut auto_map);
                     });
@@ -2836,7 +2904,7 @@ impl MapWindow {
               cal_action: &mut Option<CalAction>,
               pin_data: Option<&PinData>, filter: &pins::FilterState,
               icons: &HashMap<u32, egui::TextureHandle>,
-              active_floor: Option<(&pins::FloorInfo, Option<egui::TextureId>)>,
+              active_floor: &[(&pins::FloorInfo, Option<egui::TextureId>, bool)],
               completed: &std::collections::HashSet<u64>,
               selected: &mut Option<SelectedPin>,
               auto_notes: &[(String, std::time::Instant)],
@@ -2991,10 +3059,13 @@ impl MapWindow {
             }
         }
 
-        // ── Floor (layer) overlay ──
+        // ── Floor (layer) overlay stack ──
         // NOTE: floor rects are in RAW pin space; the canvas works in
-        // canvas space (raw + origin).
-        if let Some((floor, Some(tex_id))) = active_floor {
+        // canvas space (raw + origin). Shallow stack members draw first
+        // (dimmed), the active layer last (on top, full brightness) —
+        // like the in-game map.
+        for (floor, tex_id, dimmed) in active_floor {
+            let Some(tex_id) = tex_id else { continue };
             let (rl, rt) = (
                 floor.rect.0 + data.origin.0,
                 floor.rect.1 + data.origin.1,
@@ -3008,10 +3079,14 @@ impl MapWindow {
             let sz = egui::vec2(
                 (rr - rl) as f32 * *zoom,
                 (rb - rt) as f32 * *zoom);
-            painter.image(tex_id,
+            painter.image(*tex_id,
                 egui::Rect::from_min_size(min, sz),
                 egui::Rect::from_min_max(egui::pos2(0.,0.), egui::pos2(1.,1.)),
-                egui::Color32::WHITE);
+                if *dimmed {
+                    egui::Color32::from_rgb(140, 140, 140)
+                } else {
+                    egui::Color32::WHITE
+                });
         }
 
         // Screen helper for map-pixel positions.
@@ -3030,21 +3105,33 @@ impl MapWindow {
             // Candidates for click hit-testing.
             let mut hit: Option<(f32, u64, u32, egui::Pos2)> = None; // (dist², id, label, pos)
 
+            // Render-stack membership: surface pins always show (dimmed
+            // under an active floor); floor pins show for every stack
+            // member — dimmed except the active floor.
+            let stack_ids: std::collections::HashSet<u64> = active_floor
+                .iter()
+                .flat_map(|(f, _, _)| f.point_ids.iter().copied())
+                .collect();
+            let active_ids: Option<&std::collections::HashSet<u64>> =
+                active_floor
+                    .iter()
+                    .find(|(_, _, dimmed)| !dimmed)
+                    .map(|(f, _, _)| &f.point_ids);
+
             for idx in vis {
                 let pin = &pd.pins[idx];
                 if !filter.is_enabled(pin.label_id) { continue; }
-                // Floor (layer) pin partitioning: show only the active
-                // floor's pins, or only surface pins when on the surface.
+                // Floor (layer) pin partitioning by the render stack.
                 let in_any_floor = pd.floors.iter()
                     .any(|f| f.point_ids.contains(&pin.id));
-                match active_floor {
-                    Some((floor, _)) => {
-                        if !floor.point_ids.contains(&pin.id) { continue; }
-                    }
-                    None => {
-                        if in_any_floor { continue; }
-                    }
-                }
+                if in_any_floor && !stack_ids.contains(&pin.id) { continue; }
+                let layer_dim = if active_floor.is_empty() {
+                    false // pure surface view
+                } else if !in_any_floor {
+                    true // surface under an active floor
+                } else {
+                    !active_ids.is_some_and(|s| s.contains(&pin.id))
+                };
                 let done = completed.contains(&pin.id);
                 if done && filter.hide_completed { continue; }
                 total_vis += 1;
@@ -3069,6 +3156,8 @@ impl MapWindow {
                     }
                     let tint = if done {
                         egui::Color32::from_rgba_unmultiplied(255,255,255,90)
+                    } else if layer_dim {
+                        egui::Color32::from_rgba_unmultiplied(255,255,255,120)
                     } else {
                         egui::Color32::WHITE
                     };
