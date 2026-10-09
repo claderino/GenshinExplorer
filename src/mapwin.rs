@@ -2328,19 +2328,22 @@ impl MapWindow {
         let (resp, painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
         let rect = resp.rect;
 
-        // Center-on-pin request from the popup.
+        // Center-on-pin request from the popup (canvas-relative center).
         if let Some((mx, my)) = center_request.take() {
             *follow = false;
-            *pan = rect.center().to_vec2()
+            *pan = (rect.center() - rect.left_top())
                 - egui::vec2(mx as f32 * *zoom, my as f32 * *zoom);
         }
 
-        // Initial view: fit map width into the canvas.
+        // Initial view: fit map width into the canvas (canvas-relative
+        // center — pan is relative to rect.left_top()).
         if !*view_init {
             *zoom = (rect.width() * 0.92 / data.total_size.0 as f32)
                 .clamp(Self::min_zoom(data), 6.0);
-            *pan = rect.center().to_vec2() - egui::vec2(
-                data.total_size.0 as f32, data.total_size.1 as f32) * *zoom / 2.0;
+            *pan = (rect.center() - rect.left_top())
+                - egui::vec2(
+                    data.total_size.0 as f32,
+                    data.total_size.1 as f32) * *zoom / 2.0;
             *view_init = true;
         }
 
@@ -2356,11 +2359,15 @@ impl MapWindow {
             }
         }
 
-        // Follow — transform returns canvas map pixels.
+        // Follow — transform returns canvas map pixels. `pan` is relative
+        // to rect.left_top(), so the centering vector must be too (using
+        // the absolute rect.center() here left the dot offset down-right
+        // by the toolbar height).
         if *follow {
             if let Some((x,_,z)) = player {
                 let (ox, oy) = xf.apply(data.origin, x, z);
-                *pan = rect.center().to_vec2() - egui::vec2(ox as f32, oy as f32) * *zoom;
+                *pan = (rect.center() - rect.left_top())
+                    - egui::vec2(ox as f32, oy as f32) * *zoom;
             }
         }
 
