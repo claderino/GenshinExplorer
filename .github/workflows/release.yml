@@ -1,0 +1,52 @@
+# Release build: push a tag (v*) to publish, or run manually from the
+# Actions tab for an artifact-only build.
+#
+# The exe is self-contained: dispatch keys (keys/), the command-name
+# table (src/cmd_names.rs), the embedded emoji font (assets/) and the
+# default calibrations/layer mappings (defaults/) are all compiled in.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --verbose
+
+      - name: Tests
+        run: cargo test --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $tag = if ("$env:GITHUB_REF_TYPE" -eq "tag") { "$env:GITHUB_REF_NAME" } else { "dev-$($env:GITHUB_SHA.Substring(0,7))" }
+          $zip = "genshin-explorer-$tag-x86_64-windows.zip"
+          Compress-Archive -Path target/release/genshin-explorer.exe -DestinationPath $zip
+          "zip=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.zip }}
+          path: ${{ env.zip }}
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.zip }}
+          generate_release_notes: true
