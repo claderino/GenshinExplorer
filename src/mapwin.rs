@@ -475,7 +475,12 @@ impl MapWindow {
                 self.active_floor = None;
                 self.floor_locked = false;
             }
-            Some(id) => self.pending_layer = Some(id),
+            Some(id) => {
+                self.pending_layer = Some(id);
+                // Track even before resolution so the mapping manager can
+                // offer manual teaching for never-learned layers.
+                self.active_layer = Some(id);
+            }
         }
     }
 
@@ -1048,7 +1053,6 @@ impl MapWindow {
                     let mut learned = std::mem::take(&mut self.learned_layers);
                     let mut learned_dirty = self.learned_layers_dirty;
                     let cur_layer = self.active_layer;
-                    let mut apply_active_floor: Option<usize> = None;
                     egui::SidePanel::left("map_filters")
                         .resizable(true).default_width(230.0).min_width(200.0)
                         .show_inside(ui, |ui| {
@@ -1323,9 +1327,6 @@ impl MapWindow {
                     self.layers_open = layers_open;
                     self.learned_layers = learned;
                     self.learned_layers_dirty = learned_dirty;
-                    if let Some(i) = apply_active_floor {
-                        self.active_floor = Some(i);
-                    }
 
                     // ── Layer-mapping manager window ──
                     if self.layers_open {
@@ -1333,7 +1334,8 @@ impl MapWindow {
                         let mut learned = std::mem::take(&mut self.learned_layers);
                         let mut learned_dirty = self.learned_layers_dirty;
                         let cur_layer = self.active_layer;
-                        let mut apply_active_floor: Option<usize> = None;
+                        // Some(None) = apply surface, Some(Some(i)) = floor.
+                        let mut apply_active: Option<Option<usize>> = None;
                         let pd = pin_data.clone();
                         egui::Window::new("🗂 Layer mappings")
                             .open(&mut layers_open)
@@ -1353,9 +1355,84 @@ impl MapWindow {
                                 ui.small(
                                     "Entries are learned automatically as you \
                                      play. Fix a wrong floor here, or ✕ to \
-                                     re-learn it on your next visit.",
+                                     re-learn it on your next visit. Surface = \
+                                     outdoors (no floor overlay).",
                                 );
                                 ui.add_space(4.0);
+
+                                // The active layer has no entry yet — offer
+                                // manual teaching (Surface or any floor).
+                                if let Some(id) = cur_layer {
+                                    let already = learned
+                                        .get(&selected_map)
+                                        .map(|m| m.contains_key(&id))
+                                        .unwrap_or(false);
+                                    if !already {
+                                        let mut teach: Option<(u32, u32)> =
+                                            None;
+                                        ui.horizontal(|ui| {
+                                            ui.label("📍");
+                                            ui.monospace(id.to_string());
+                                            ui.weak("(not learned — teach it:");
+                                            egui::ComboBox::from_id_salt(
+                                                format!("layer_teach_{id}"),
+                                            )
+                                            .selected_text("pick…")
+                                            .width(250.0)
+                                            .show_ui(ui, |ui| {
+                                                if ui
+                                                    .selectable_label(
+                                                        false,
+                                                        "Surface (no floor)",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    teach = Some((0, 0));
+                                                }
+                                                for fl in &pd.floors {
+                                                    if ui
+                                                        .selectable_label(
+                                                            false,
+                                                            format!(
+                                                                "{}: {}",
+                                                                fl.group_name,
+                                                                fl.name
+                                                            ),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        teach = Some((
+                                                            fl.group_id,
+                                                            fl.floor_id,
+                                                        ));
+                                                    }
+                                                }
+                                            });
+                                            ui.weak(")");
+                                        });
+                                        if let Some((ng, nf)) = teach {
+                                            learned
+                                                .entry(selected_map)
+                                                .or_default()
+                                                .insert(id, (ng, nf));
+                                            learned_dirty = true;
+                                            apply_active = Some(
+                                                if (ng, nf) == (0, 0) {
+                                                    None
+                                                } else {
+                                                    pd.floors.iter().position(
+                                                        |fl| {
+                                                            fl.group_id == ng
+                                                                && fl.floor_id
+                                                                    == nf
+                                                        },
+                                                    )
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+
                                 let entries: Vec<u64> = learned
                                     .get(&selected_map)
                                     .map(|m| {
@@ -1376,8 +1453,11 @@ impl MapWindow {
                                                 .get(&selected_map)
                                                 .and_then(|m| m.get(&id))
                                                 .unwrap_or(&(0, 0));
-                                            let cur_text = pd
-                                                .floors
+                                            let is_surface = g == 0 && f == 0;
+                                            let cur_text = if is_surface {
+                                                "Surface (no floor)".to_owned()
+                                            } else {
+                                            pd.floors
                                                 .iter()
                                                 .find(|fl| {
                                                     fl.group_id == g
@@ -1394,7 +1474,8 @@ impl MapWindow {
                                                         "group {g} / floor {f} \
                          (missing from API)"
                                                     )
-                                                });
+                                                })
+                                            };
                                             let mut pick: Option<(u32, u32)> =
                                                 None;
                                             let mut del = false;
@@ -1413,6 +1494,15 @@ impl MapWindow {
                                                 .selected_text(cur_text)
                                                 .width(250.0)
                                                 .show_ui(ui, |ui| {
+                                                    if ui
+                                                        .selectable_label(
+                                                            is_surface,
+                                                            "Surface (no floor)",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        pick = Some((0, 0));
+                                                    }
                                                     for fl in &pd.floors {
                                                         let selected =
                                                             fl.group_id == g
@@ -1454,18 +1544,21 @@ impl MapWindow {
                                                 }
                                                 learned_dirty = true;
                                                 if cur_layer == Some(id) {
-                                                    if let Some(i) = pd
-                                                        .floors
-                                                        .iter()
-                                                        .position(|fl| {
-                                                            fl.group_id == ng
+                                                    apply_active = Some(
+                                                        if (ng, nf) == (0, 0) {
+                                                            None
+                                                        } else {
+                                                            pd.floors
+                                                                .iter()
+                                                                .position(
+                                                                    |fl| {
+                                                                        fl.group_id == ng
                                                                 && fl.floor_id
                                                                     == nf
-                                                        })
-                                                    {
-                                                        apply_active_floor =
-                                                            Some(i);
-                                                    }
+                                                                    },
+                                                                )
+                                                        },
+                                                    );
                                                 }
                                             }
                                             if del {
@@ -1490,8 +1583,9 @@ impl MapWindow {
                         self.layers_open = layers_open;
                         self.learned_layers = learned;
                         self.learned_layers_dirty = learned_dirty;
-                        if let Some(i) = apply_active_floor {
-                            self.active_floor = Some(i);
+                        if let Some(sel) = apply_active {
+                            self.active_floor = sel;
+                            self.floor_locked = sel.is_some();
                         }
                     }
 
@@ -2068,8 +2162,15 @@ impl MapWindow {
                                     .get(&self.selected_map)
                                     .and_then(|m| m.get(&layer_id))
                                     .copied();
+                                // Sentinel (0, 0) = surface (learned
+                                // "this layer is outdoors").
+                                let mut surface_pick = false;
                                 let resolved: Option<usize> =
                                     match known {
+                                        Some((0, 0)) => {
+                                            surface_pick = true;
+                                            None
+                                        }
                                         Some((gid, fid)) => {
                                             pd.floors.iter().position(
                                                 |f| {
@@ -2144,7 +2245,14 @@ impl MapWindow {
                                             }
                                         }
                                     };
-                                if let Some(fi) = resolved {
+                                if surface_pick {
+                                    tracing::info!(
+                                        "map layer {layer_id} → surface"
+                                    );
+                                    self.active_floor = None;
+                                    self.floor_locked = false;
+                                    self.pending_layer = None;
+                                } else if let Some(fi) = resolved {
                                     tracing::info!(
                                         "map layer {layer_id} → floor {fi} ({})",
                                         pd.floors[fi].name
