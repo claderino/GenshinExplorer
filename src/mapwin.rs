@@ -307,6 +307,11 @@ pub struct MapWindow {
     /// Learned map-layer id → floor identity (group_id, floor_id),
     /// persisted per map in `learned_map_layers.json`.
     learned_layers: std::collections::HashMap<u32, std::collections::HashMap<u64, (u32, u32)>>,
+    /// Calibration frame → floor identity ((group_id, floor_id); None =
+    /// surface or legacy frames). Frames on layered maps are keyed by
+    /// floor, not world-position proximity — separate floors share
+    /// overlapping local coordinate ranges and would otherwise merge.
+    cal_frame_floors: Vec<Option<(u32, u32)>>,
     /// Dirty flag for the learned-layers save.
     learned_layers_dirty: bool,
     // ── HoYoLab import ──
@@ -363,13 +368,14 @@ pub struct MapWindow {
 impl MapWindow {
     pub fn new() -> Self {
         let selected_map = 2;
-        let (cal_off, cal_scale, cal_points) =
+        let (cal_off, cal_scale, cal_points, cal_frame_floors) =
             Self::load_calibration(selected_map);
         Self {
             state: MapLoadState::Idle, open: true,
             pan: egui::Vec2::ZERO, zoom: 0.05, view_init: false, follow: true,
             calibrate_offset: cal_off, calibrating: false,
             cal_points,
+            cal_frame_floors,
             active_cal_frame: 0,
             active_floor: None,
             floor_locked: false,
@@ -636,15 +642,20 @@ impl MapWindow {
             .join("GenshinExplorer").join(format!("map_calibration_{map_id}.json")))
     }
     fn load_calibration(map_id: u32)
-        -> (Option<(f64, f64)>, Option<(f64, f64)>, Vec<Vec<CalPoint>>)
+        -> (
+            Option<(f64, f64)>,
+            Option<(f64, f64)>,
+            Vec<Vec<CalPoint>>,
+            Vec<Option<(u32, u32)>>,
+        )
     {
         let Ok(text) = std::fs::read_to_string(
             Self::calibration_path(map_id).unwrap_or_default(),
         ) else {
-            return (None, None, Vec::new());
+            return (None, None, Vec::new(), Vec::new());
         };
         let Ok(j) = serde_json::from_str::<serde_json::Value>(&text) else {
-            return (None, None, Vec::new());
+            return (None, None, Vec::new(), Vec::new());
         };
         let g = |k: &str| j.get(k).and_then(|v| v.as_f64());
         let offset = match (g("offset_x"), g("offset_y")) {
@@ -689,13 +700,33 @@ impl MapWindow {
                 }
             }
         }
-        (offset, scale, frames)
+        // Per-frame floor identities (None for legacy files).
+        let mut frame_floors: Vec<Option<(u32, u32)>> =
+            vec![None; frames.len()];
+        if let Some(arr) =
+            j.get("frame_floors").and_then(|v| v.as_array())
+        {
+            for (i, v) in arr.iter().enumerate() {
+                if i >= frame_floors.len() { break; }
+                if let Some(pair) = v.as_array() {
+                    if pair.len() == 2 {
+                        if let (Some(g), Some(f)) =
+                            (pair[0].as_u64(), pair[1].as_u64())
+                        {
+                            frame_floors[i] = Some((g as u32, f as u32));
+                        }
+                    }
+                }
+            }
+        }
+        (offset, scale, frames, frame_floors)
     }
     fn save_calibration(
         map_id: u32,
         offset: Option<(f64, f64)>,
         scale: Option<(f64, f64)>,
         frames: &[Vec<CalPoint>],
+        frame_floors: &[Option<(u32, u32)>],
     ) {
         if let Some(p) = Self::calibration_path(map_id) {
             let mut v = serde_json::json!({});
@@ -706,6 +737,15 @@ impl MapWindow {
             if let Some((x, y)) = scale {
                 v["scale_x"] = x.into();
                 v["scale_y"] = y.into();
+            }
+            let floors_json: Vec<_> = (0..frames.len())
+                .map(|i| match frame_floors.get(i) {
+                    Some(Some((g, f))) => serde_json::json!([g, f]),
+                    _ => serde_json::Value::Null,
+                })
+                .collect();
+            if !floors_json.is_empty() {
+                v["frame_floors"] = floors_json.into();
             }
             let frames_json: Vec<_> = frames
                 .iter()
@@ -1876,20 +1916,20 @@ impl MapWindow {
                     // Teleport → floor auto-selection. Two strategies:
                     //
                     // 1. SAME-SCENE teleports (surface y range, -100..1000):
-                    //    nearest-pin ownership matching — the arrival canvas
-                    //    position is reliable, so the nearest pin's floor
-                    //    ownership is authoritative.
+                    //    nearest-pin ownership matching.
                     // 2. CROSS-SCENE teleports (instanced y, >1000 or <-200):
-                    //    the surface transform produces garbage canvas coords,
-                    //    so use the PREVIOUS surface position instead — find
-                    //    the floor whose entrance pin was nearest.
+                    //    the PREVIOUS surface position finds the floor
+                    //    whose entrance pin was nearest.
                     //
-                    // Layer packets (5991) OUTRANK these heuristics: both fire
-                    // around the same transition, but the position sample
-                    // lags the layer packet by up to a few seconds — without
-                    // this guard the pin-match would overwrite the layer
-                    // decision right after it lands (and its no-match path
-                    // would unlock a fresh surface lock).
+                    // Layer packets OUTRANK these heuristics — and now that
+                    // the 5991 system is solid, pin-matching only acts when
+                    // the layer system has NO state at all (login bootstrap
+                    // — the one moment no boundary gets crossed — or floors
+                    // that never report). Mid-session teleports on layered
+                    // maps let the layer report decide; this prevents
+                    // calibration-dependent wrong switches.
+                    let layer_stateless = self.active_layer.is_none()
+                        && self.pending_layer.is_none();
                     let layer_recent = self
                         .layer_authoritative_at
                         .map(|t| {
@@ -1897,10 +1937,12 @@ impl MapWindow {
                                 < std::time::Duration::from_secs(10)
                         })
                         .unwrap_or(false);
-                    if layer_recent && !self.pending_teleports.is_empty() {
+                    if (!layer_stateless || layer_recent)
+                        && !self.pending_teleports.is_empty()
+                    {
                         tracing::debug!(
-                            "teleport floor-match skipped — layer packet \
-                             decided within the last 10 s"
+                            "teleport floor-match skipped — layer packets \
+                             own this decision"
                         );
                         self.pending_teleports.clear();
                     }
@@ -2482,14 +2524,29 @@ impl MapWindow {
                         self.cal_points.iter().map(|f| f.len()).sum();
                     // "Far from every calibration point" = an uncalibrated
                     // frame (a new layer) — tell the user what to do.
+                    // Floor-keyed frames: on a floor, assigned = a frame
+                    // exists for that floor identity.
                     let mut cal_unassigned = false;
                     if let Some((x, _, z)) = player {
-                        if !self.cal_points.is_empty()
-                            && assign_frame(
+                        let assigned = match self.active_floor.and_then(
+                            |fi| {
+                                pin_data.as_ref().and_then(|pd| {
+                                    pd.floors.get(fi).map(|f| {
+                                        (f.group_id, f.floor_id)
+                                    })
+                                })
+                            },
+                        ) {
+                            Some(ident) => self
+                                .cal_frame_floors
+                                .iter()
+                                .any(|f| *f == Some(ident)),
+                            None => assign_frame(
                                 &self.cal_points, x, z, self.scene_gen,
                             )
-                            .is_none()
-                        {
+                            .is_some(),
+                        };
+                        if !self.cal_points.is_empty() && !assigned {
                             cal_unassigned = true;
                         }
                     }
@@ -2670,6 +2727,7 @@ impl MapWindow {
                         }
                     }
                     let mut cal_action: Option<CalAction> = None;
+                    let pd_floors = pin_data.as_deref();
                     egui::CentralPanel::default().show_inside(ui, |ui| {
                         Self::canvas(ui, tex, store, &md, player,
                             &mut pan, &mut zoom, &mut follow, &mut calibrating,
@@ -2686,24 +2744,75 @@ impl MapWindow {
                     }
                     self.auto_map = auto_map;
 
-                    // Calibration actions: add a point (auto-solve, frame
-                    // auto-assigned by proximity; new frames for new layers)
-                    // or clear everything.
+                    // Calibration actions: add a point (auto-solve; frames
+                    // on layered maps are keyed by the ACTIVE FLOOR's
+                    // identity — separate floors share overlapping local
+                    // coordinate ranges, so world-position proximity would
+                    // merge them) or clear everything.
                     if let Some(action) = cal_action {
                         match action {
                             CalAction::AddPoint { mx, my } => {
                                 if let Some((wx, _, wz)) = player {
-                                    // Frame assignment: same scene generation
-                                    // first (layers are separate scenes), then
-                                    // any frame with a close point; otherwise
-                                    // a new frame.
-                                    let frame_idx = assign_frame(
-                                        &self.cal_points, wx, wz, self.scene_gen,
-                                    )
-                                    .unwrap_or_else(|| {
-                                        self.cal_points.push(Vec::new());
-                                        self.cal_points.len() - 1
-                                    });
+                                    // Frame assignment: floor identity when
+                                    // standing on a floor; scene-gen +
+                                    // proximity on the surface / flat maps.
+                                    let frame_idx = match self
+                                        .active_floor
+                                        .and_then(|fi| {
+                                            pd_floors
+                                                .as_ref()
+                                                .and_then(|pd| {
+                                                    pd.floors.get(fi).map(
+                                                        |f| {
+                                                            (
+                                                                f.group_id,
+                                                                f.floor_id,
+                                                            )
+                                                        },
+                                                    )
+                                                })
+                                        }) {
+                                        Some(ident) => {
+                                            match self
+                                                .cal_frame_floors
+                                                .iter()
+                                                .position(
+                                                    |f| *f == Some(ident),
+                                                ) {
+                                                Some(i) => i,
+                                                None => {
+                                                    self.cal_points
+                                                        .push(Vec::new());
+                                                    self.cal_frame_floors
+                                                        .push(Some(ident));
+                                                    self.cal_points.len()
+                                                        - 1
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            let idx = assign_frame(
+                                                &self.cal_points, wx, wz,
+                                                self.scene_gen,
+                                            )
+                                            .unwrap_or_else(|| {
+                                                self.cal_points
+                                                    .push(Vec::new());
+                                                self.cal_frame_floors
+                                                    .push(None);
+                                                self.cal_points.len() - 1
+                                            });
+                                            while self
+                                                .cal_frame_floors
+                                                .len()
+                                                < self.cal_points.len()
+                                            {
+                                                self.cal_frame_floors
+                                                    .push(None);
+                                            }
+                                            idx
+                                        }
+                                    };
                                     self.cal_points[frame_idx].push(CalPoint {
                                         wx, wz, mx, my, scene_gen: self.scene_gen,
                                     });
@@ -2720,6 +2829,7 @@ impl MapWindow {
                                     Self::save_calibration(
                                         md.map_id, self.calibrate_offset,
                                         self.cal_scale, &self.cal_points,
+                                        &self.cal_frame_floors,
                                     );
                                     let n = self.cal_points[frame_idx].len();
                                     let frames = self.cal_points.len();
@@ -2739,10 +2849,13 @@ impl MapWindow {
                             }
                             CalAction::Clear => {
                                 self.cal_points.clear();
+                                self.cal_frame_floors.clear();
                                 self.active_cal_frame = 0;
                                 self.cal_scale = None;
                                 self.calibrate_offset = None;
-                                Self::save_calibration(md.map_id, None, None, &[]);
+                                Self::save_calibration(
+                                    md.map_id, None, None, &[], &[],
+                                );
                                 self.auto_notes.push((
                                     "📍 calibration cleared".into(),
                                     std::time::Instant::now(),
@@ -2872,10 +2985,12 @@ impl MapWindow {
                 self.active_layer = None;
                 self.floor_locked = false;         // surface locks don't carry over
                 self.floor_overlays.clear();
-                let (off, scale, pts) = Self::load_calibration(id);
+                let (off, scale, pts, frame_floors) =
+                    Self::load_calibration(id);
                 self.calibrate_offset = off;
                 self.cal_scale = scale;
                 self.cal_points = pts;
+                self.cal_frame_floors = frame_floors;
                 self.pan = egui::Vec2::ZERO; self.view_init = false; self.follow = true;
                 self.start_pin_load();
                 self.start_map_download(cache_dir);
