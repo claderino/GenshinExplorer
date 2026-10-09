@@ -228,8 +228,12 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
         let mut last_scene_notify: Option<std::time::Instant> = None;
         // Position flow = game actively running. The world pauses while the
         // in-game map is open, which also pauses region broadcasts — the
-        // Teyvat fallback must not fire then.
+        // Teyvat fallback must not fire then. The direct carrier keeps
+        // reporting a FROZEN position while paused, so liveness alone is
+        // not enough: the fallback also requires the position to have
+        // actually changed recently (last_pos_change_at).
         let mut last_position_at: Option<std::time::Instant> = None;
+        let mut last_pos_change_at: Option<std::time::Instant> = None;
         let mut last_chest_send: Option<std::time::Instant> = None;
         // Full research capture: ALL decrypted commands, any size, first
         // 1KB of hex. No count limit — for targeted analysis sessions.
@@ -485,6 +489,18 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                             && last_position_at
                                 .map(|t| {
                                     t.elapsed() < Duration::from_secs(8)
+                                })
+                                .unwrap_or(false)
+                            && last_pos_change_at
+                                .map(|t| {
+                                    // World actually running — a frozen
+                                    // position (in-game map open, world
+                                    // paused) must not trigger the
+                                    // fallback; 60 s is generous enough
+                                    // to cover a brief stop after really
+                                    // leaving a region.
+                                    t.elapsed()
+                                        < Duration::from_secs(60)
                                 })
                                 .unwrap_or(false)
                         {
@@ -757,6 +773,22 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                     let _ = tx.send(Msg::TeleportArrival {
                                         x: px, y: py, z: pz, dy: 0.0,
                                     });
+                                }
+                                // Liveness for the region fallback: the
+                                // direct carrier reports a frozen position
+                                // while the in-game map is open (world
+                                // paused) — only a real change proves the
+                                // world is running.
+                                let moved = last_sent_pos
+                                    .map(|(lx, ly, lz)| {
+                                        (px - lx).abs() > 0.5
+                                            || (py - ly).abs() > 0.5
+                                            || (pz - lz).abs() > 0.5
+                                    })
+                                    .unwrap_or(true);
+                                if moved {
+                                    last_pos_change_at =
+                                        Some(std::time::Instant::now());
                                 }
                                 // Teleport: a big x-z jump OR a big height
                                 // jump. Layered teleports (stacked floors)

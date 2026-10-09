@@ -2008,6 +2008,11 @@ impl MapWindow {
                         let mut candidate: Option<u32> = None;
                         for (mid, _) in pins::available_maps() {
                             if mid == self.selected_map { continue; }
+                            // Map 40 (the moon) is a separate WORLD: its
+                            // canvas box overlaps Teyvat coordinates, and
+                            // height can't discriminate it — region packets
+                            // (MoonFatigue) own it exclusively.
+                            if mid == 40 { continue; }
                             // Underground maps need a height sanity check.
                             if matches!(mid, 7 | 9 | 34) && py > 50.0 { continue; }
                             if let Some((origin, total)) = Self::cached_map_extent(mid) {
