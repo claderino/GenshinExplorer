@@ -229,3 +229,40 @@ match handles noise filtering.
 `map_calibration_{map_id}.json` — per-map world→map calibration.
 `completed_pins.json` — `{"{uid}_{map}": [pin ids]}`.
 `pin_filters_v3[_{uid}]_{map}.json` — enabled labels + hide-collected.
+
+## 12. Map layers & scenes (7.1.0, from capyb2222/genshin-protocol protos + captures)
+
+The Chinese community mirror `capyb2222/genshin-protocol` publishes per-version
+deobfuscated protos with CmdId annotations (`proto/7.1.0.proto`, 4919 commands,
+100% of our capture identified; see `src/cmd_names.rs`).
+
+### `_EnterMapLayerReq` (5991) / `_EnterMapLayerRsp` (21115)
+- Req payload: `{4: map_layer_id}` (empty = default/base layer). Rsp: bare retcode.
+- Fires when the client's minimap switches to a named layer, right after
+  `EnterWorldAreaReq` (25407) on world-area border crossings.
+- Observed ids are structured: `1029_00NN_0M` = area NN, sub-layer M.
+  Capture shows `1029000601 -> 1029000602 -> 1029000601` — a floor descent
+  and return within moon area 6. All `1029...` ids observed on the moon;
+  `3340102` seen once on Teyvat.
+- The point_group API has a per-floor `game_layer_ids` field — the intended
+  join key — but HoYoLab leaves it empty, so the id->floor mapping is learned
+  empirically (rect containment at report time) and persisted in
+  `learned_map_layers.json`.
+
+### `PlayerEnterSceneNotify` (9582)
+Carries `scene_id` (field 9), `prev_scene_id` (6), `scene_tag_id_list` (5)
+and `_map_layer_info` (1217, unlocked layers). Observed scene ids:
+moon = 4294906496, Teyvat = 4294906403, Chasm underground = 4294906400,
+instanced areas = 4294906497/411/503. The moon's scene tags toggle with floors
+(1763/1764 + 1876 track layer switches), corroborating 5991.
+
+### `LevelTagDataNotify` (863) — NOT an area signal
+`{14: packed varint level_tag_id_list}`. The set is the account's global
+story/unlock state: it differs between game accounts (observed across a UID
+switch) and stays identical across moon -> Chasm -> surface -> moon.
+Useful only as a login/account fingerprint.
+
+### Region broadcasts (6771 `RegionalPlayInfoNotify`) — stragglers
+Two shapes: periodic (field 9 present, 1-2 Hz while inside) and a 2-byte-shorter
+straggler (field 9 absent) sent once on *leaving*. Stragglers must not refresh
+the silence timer (they added ~15 s of lag to map switches before the fix).
