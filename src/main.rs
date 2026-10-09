@@ -222,6 +222,13 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
         let mut region_feature_at: Option<(String, std::time::Instant)> = None;
         let mut active_region: Option<u32> = None;
         let mut first_position_at: Option<std::time::Instant> = None;
+        // Scene-id tracking (9582 PlayerEnterSceneNotify) — the
+        // authoritative "which world am I in" signal. Separate regions
+        // (Chasm, moon, Enkanomiya, …) each have their own scene and
+        // their own local coordinate system; cross-map geometry is
+        // meaningless between them.
+        let mut current_scene: Option<u64> = None;
+        let mut seen_unknown_scenes: Vec<u64> = Vec::new();
         // Big packets (>1 KB) only fire on real scene changes (enter-scene
         // notifies) — distinguishes the Chasm underground (scene change)
         // from its surface (same scene as Teyvat).
@@ -439,6 +446,48 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                             );
                         }
 
+                        // Scene entry (9582): the authoritative world
+                        // discriminator — each separate region has its
+                        // own scene id and local coordinates. Known ids
+                        // drive the map directly; unknown ones are
+                        // logged once so they can be mapped later.
+                        if command.command_id == 9582 {
+                            if let Some((scene, prev)) =
+                                explore::detect_scene_enter(
+                                    &command.proto_data,
+                                )
+                            {
+                                tracing::debug!(
+                                    scene,
+                                    prev,
+                                    "scene enter"
+                                );
+                                current_scene = Some(scene);
+                                let mapped = match scene {
+                                    429_4906_403 => Some(2u32),  // Teyvat
+                                    429_4906_400 => Some(9u32),  // Chasm mines
+                                    429_4906_496 => Some(40u32), // moon
+                                    _ => None,
+                                };
+                                if let Some(map_id) = mapped {
+                                    if active_region != Some(map_id) {
+                                        active_region = Some(map_id);
+                                        let _ =
+                                            tx.send(Msg::Region(map_id));
+                                    }
+                                } else if !seen_unknown_scenes
+                                    .contains(&scene)
+                                {
+                                    seen_unknown_scenes.push(scene);
+                                    tracing::info!(
+                                        scene,
+                                        "unknown scene id — visit-logged \
+                                         for region mapping"
+                                    );
+                                }
+                            }
+                        }
+
                         // Region features (6771 = RegionalPlayInfoNotify):
                         // periodic broadcast naming the special region the
                         // player is inside. Stragglers (field 9 absent) are
@@ -511,7 +560,14 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                         let needs_surface = match active_region {
                             Some(r) => r != 2,
                             None => true, // default to surface when unknown
-                        };
+                        }
+                            // Only flip to Teyvat from the Teyvat scene
+                            // itself (or before any scene was seen) —
+                            // unknown separate regions (Enkanomiya etc.)
+                            // must not be dragged to the surface map.
+                            && current_scene
+                                .map(|s| s == 429_4906_403)
+                                .unwrap_or(true);
                         let broadcast_silent = region_feature_at
                             .as_ref()
                             .map(|(_, t)| {

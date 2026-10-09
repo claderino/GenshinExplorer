@@ -409,6 +409,26 @@ pub fn detect_challenge_result(cmd: &GameCommand) -> Option<ChallengeResult> {
     }
 }
 
+/// Scene-entry (cmd 9582 = PlayerEnterSceneNotify): `{9: scene_id,
+/// 6: prev_scene_id, …}`. Every separate region has its own scene id —
+/// this is the authoritative "which world am I in" signal:
+/// Teyvat 4294906403, Chasm mines 4294906400, moon 4294906496
+/// (observed in 7.1 captures). Returns (scene_id, prev_scene_id).
+pub fn detect_scene_enter(buf: &[u8]) -> Option<(u64, u64)> {
+    let fields = parse(buf)?;
+    let scene = fields
+        .iter()
+        .find(|(f, _)| *f == 9)?
+        .1
+        .as_varint()?;
+    let prev = fields
+        .iter()
+        .find(|(f, _)| *f == 6)
+        .and_then(|(_, v)| v.as_varint())
+        .unwrap_or(0);
+    Some((scene, prev))
+}
+
 /// Map-layer entry (cmd 5991 = _EnterMapLayerReq): `{4: map_layer_id}` —
 /// sent by the client whenever the minimap switches to a named layer
 /// (moon districts, underground floors). Observed ids are structured:

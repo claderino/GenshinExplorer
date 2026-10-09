@@ -281,8 +281,10 @@ pub struct MapWindow {
     label_search: String,
     /// Auto-switch sub-map when the player enters its canvas.
     auto_map: bool,
-    /// Persistence tracker for auto-switch (candidate, first-seen).
-    auto_switch_pending: Option<(u32, std::time::Instant)>,
+    /// Manual dropdown pick locks the selected map — auto-switching
+    /// stands down until a region packet/scene id fires or the
+    /// 🗺 auto toggle is cycled.
+    manual_map_lock: bool,
     /// Region-broadcast switch (authoritative, from packets).
     pending_region: Option<u32>,
     /// While a region broadcast is active (non-Teyvat), geometric
@@ -401,7 +403,7 @@ impl MapWindow {
             center_request: None,
             label_search: String::new(),
             auto_map: true,
-            auto_switch_pending: None,
+            manual_map_lock: false,
             pending_region: None,
             region_lock: None,
             pending_layer: None,
@@ -843,6 +845,7 @@ impl MapWindow {
         let mut follow = self.follow; let mut calibrating = self.calibrating;
         let mut view_init = self.view_init;
         let mut new_map: Option<u32> = None;
+        let mut manual_lock = self.manual_map_lock;
 
         let pin_data = if let PinState::Loaded(d) = &self.pin_state { Some(d.clone()) } else { None };
         let mut pin_filter = self.pin_filter.clone();
@@ -1323,7 +1326,27 @@ impl MapWindow {
                                              auto-collections still need ⬆ Export.");
                                 });
                             // Scrollable top section.
-                            new_map = Self::map_selector(ui, "map_sel_sidebar", selected_map);
+                            // Manual map pick → lock (region packets
+                            // still override).
+                            let mut manual_lock = self.manual_map_lock;
+                            let manual_pick = Self::map_selector(
+                                ui,
+                                "map_sel_sidebar",
+                                selected_map,
+                            );
+                            if manual_pick.is_some() {
+                                new_map = manual_pick;
+                                manual_lock = true;
+                            }
+                            if manual_lock {
+                                ui.label("🔒")
+                                    .on_hover_text(
+                                        "Manual map selection — geometric \
+                                         auto-switching paused. A region \
+                                         packet (Chasm / moon / surface) \
+                                         or cycling 🗺 auto resumes it.",
+                                    );
+                            }
                             // Floor (layer) selector — only on layered maps.
                             if let Some(pd) = pin_data.as_ref() {
                                 if !pd.floors.is_empty() {
@@ -1372,6 +1395,7 @@ impl MapWindow {
                     self.sync_open = sync_open;
                     self.sync_cookie = sync_cookie;
                     self.sync_auto = sync_auto;
+                    self.manual_map_lock = manual_lock;
                     self.sync_profiles = profiles;
                     self.sync_profile_idx = sync_profile_idx;
                     self.sync_profile_name = sync_profile_name;
@@ -2256,81 +2280,14 @@ impl MapWindow {
                         }
                     }
 
-                    // Auto-switch sub-map (geometric): candidates are
-                    // restricted to the current WORLD FRAME. The moon
-                    // frame ({36, 37, 40}) shares one coordinate space
-                    // and ONE region broadcast (MoonFatigue) — its
-                    // sub-maps are distinguished by canvas containment,
-                    // smallest box wins (Temple of Space ⊂ Ancient
-                    // Sacred Mountain ⊂ Frost Moon, so first-match
-                    // ordering would confuse them). The Teyvat frame
-                    // ({2, 7, 9, 34}) keeps the underground height
-                    // guard; moon-frame boxes overlap Teyvat
-                    // coordinates, so they must never be candidates
-                    // while in the Teyvat frame.
-                    // (Gated by 🗺 auto only — 📍 follow is just the
-                    // camera. MoonFatigue does NOT stand down here — it
-                    // covers the whole moon world, and its sub-maps can
-                    // only be told apart geometrically.)
-                    let moon_world = self.region_lock == Some(40);
-                    if self.auto_map
-                        && (self.region_lock.is_none() || moon_world)
-                        && player.is_some()
-                    {
-                        let (px, py, pz) = player.unwrap();
-                        // Best (smallest containing) canvas in the
-                        // current frame, INCLUDING the selected map —
-                        // nested canvases must not switch away.
-                        let mut best: Option<(f64, u32)> = None;
-                        for (mid, _) in pins::available_maps() {
-                            let in_moon_frame =
-                                matches!(mid, 36 | 37 | 40);
-                            if in_moon_frame != moon_world { continue; }
-                            // Underground maps need a height sanity check.
-                            if !moon_world
-                                && matches!(mid, 7 | 9 | 34)
-                                && py > 50.0
-                            {
-                                continue;
-                            }
-                            if let Some((origin, total)) =
-                                Self::map_frame_extent(mid)
-                            {
-                                let mx = origin.0 - pz as f64;
-                                let my = origin.1 - px as f64;
-                                if (0.0..=total.0).contains(&mx)
-                                    && (0.0..=total.1).contains(&my)
-                                {
-                                    let area = total.0 * total.1;
-                                    if best
-                                        .map(|(a, _)| area < a)
-                                        .unwrap_or(true)
-                                    {
-                                        best = Some((area, mid));
-                                    }
-                                }
-                            }
-                        }
-                        let candidate = best
-                            .filter(|(_, mid)| *mid != self.selected_map)
-                            .map(|(_, mid)| mid);
-                        match (candidate, self.auto_switch_pending) {
-                            (Some(mid), Some((pmid, since))) if mid == pmid => {
-                                if since.elapsed().as_secs_f32() >= 5.0 {
-                                    tracing::info!("auto-switching to map {mid}");
-                                    new_map = Some(mid);
-                                    self.auto_switch_pending = None;
-                                }
-                            }
-                            (Some(mid), _) => {
-                                self.auto_switch_pending =
-                                    Some((mid, std::time::Instant::now()));
-                            }
-                            (None, _) => self.auto_switch_pending = None,
-                        }
-                    } else {
-                        self.auto_switch_pending = None;
-                    }
+                    // NOTE: there is NO geometric sub-map auto-switching.
+                    // Every sub-map (7/9/34/36/37/40) is a separate
+                    // REGION with its own local coordinate system —
+                    // cross-map canvas containment is meaningless
+                    // (verified: the Chasm mines report small local
+                    // coords like (402, 419, 396), just like the moon).
+                    // Map authority is: scene ids + region broadcasts
+                    // (worker) → manual selection (locked) in between.
 
                     if start_sync && self.sync_job.is_none() {
                         // Inline sync_uid(): &self method conflicts with the
@@ -2665,6 +2622,10 @@ impl MapWindow {
                             &mut quick_toggle, &mut center_request, &mut auto_map);
                     });
                     self.center_request = center_request;
+                    // Cycling 🗺 auto (off→on) releases a manual map lock.
+                    if self.auto_map && !auto_map {
+                        self.manual_map_lock = false;
+                    }
                     self.auto_map = auto_map;
 
                     // Calibration actions: add a point (auto-solve, frame
@@ -2824,8 +2785,11 @@ impl MapWindow {
         if filter_changed { self.pin_filter=pin_filter; self.pin_filter.save(&Self::data_dir(), self.bucket(), selected_map); }
 
         // Region-broadcast switch (authoritative) — merged with any manual
-        // selection from this frame.
+        // selection from this frame. Region packets outrank the manual
+        // lock: crossing into the Chasm / the moon / back to the surface
+        // re-takes control and re-arms geometric switching.
         if let Some(r) = self.pending_region.take() {
+            self.manual_map_lock = false;
             if new_map.is_none() {
                 new_map = Some(r);
             }
@@ -2955,41 +2919,6 @@ impl MapWindow {
         let name = pd.labels.iter().find(|l| l.id == label_id)
             .map(|l| l.name.clone()).unwrap_or_else(|| "Pin".into());
         Some(name)
-    }
-
-    /// Canvas extent (origin, total_size) for a map from the cached info
-    /// file — only maps the user has visited have a cache entry.
-    fn cached_map_extent(map_id: u32)
-        -> Option<((f64, f64), (f64, f64))> {
-        let dir = Self::data_dir().join("map");
-        let text = std::fs::read_to_string(
-            dir.join(format!("info_v3_{map_id}.json"))).ok()?;
-        let json: serde_json::Value = serde_json::from_str(&text).ok()?;
-        let v2 = json.pointer("/data/info/detail_v2")?;
-        let a = |key: &str| -> Option<(f64, f64)> {
-            let arr = v2.get(key)?.as_array()?;
-            Some((arr[0].as_f64()?, arr[1].as_f64()?))
-        };
-        Some((a("origin")?, a("total_size")?))
-    }
-
-    /// Map extent for frame-matching, with builtin fallbacks (detail_v2
-    /// values as served by the API on 2026-10-09) for maps whose info
-    /// isn't cached locally yet.
-    fn map_frame_extent(map_id: u32)
-        -> Option<((f64, f64), (f64, f64))> {
-        Self::cached_map_extent(map_id).or_else(|| {
-            Some(match map_id {
-                2 => ((24206.0, 8918.0), (36864.0, 18432.0)),
-                7 => ((1849.0, 1779.0), (4096.0, 4096.0)),
-                9 => ((2016.0, 1956.0), (4096.0, 4096.0)),
-                34 => ((2144.0, 2140.0), (4096.0, 4096.0)),
-                36 => ((2200.0, 1823.0), (4096.0, 4096.0)),
-                37 => ((1515.0, 1416.0), (3072.0, 3072.0)),
-                40 => ((2617.0, 4155.0), (10240.0, 8192.0)),
-                _ => return None,
-            })
-        })
     }
 
     /// Combo box for map selection; returns Some(map_id) when changed.
