@@ -198,6 +198,14 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
         // Teyvat fallback must not fire then.
         let mut last_position_at: Option<std::time::Instant> = None;
         let mut last_chest_send: Option<std::time::Instant> = None;
+        // Full research capture: ALL decrypted commands, any size, first
+        // 1KB of hex. No count limit — for targeted analysis sessions.
+        let mut fullcap_log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(data_dir.join("fullcap.jsonl"))?;
+        let mut fullcap_count: u64 = 0;
+
         let mut last_pos_write: HashMap<u64, std::time::Instant> = HashMap::new();
 
         loop {
@@ -315,6 +323,15 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                             last_big_packet = Some(std::time::Instant::now());
                         }
 
+                        // Named entity notifications — entity type names as
+                        // readable strings (spawn/despawn lifecycle).
+                        if let Some(ne) = explore::detect_named_entity(command) {
+                            tracing::debug!(
+                                "entity: {} (id={}, action={})",
+                                ne.name, ne.entity_id, ne.action
+                            );
+                        }
+
                         // Region features (6771 shape): periodic broadcast
                         // naming the special region the player is inside.
                         if command.proto_data.len() <= 96 {
@@ -400,6 +417,29 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                             } else {
                                 scene_capture_until = None;
                             }
+                        }
+
+                        // Full research capture: log every command.
+                        {
+                            use std::io::Write;
+                            fullcap_count += 1;
+                            let hex: String = command
+                                .proto_data
+                                .iter()
+                                .take(512) // 512 bytes = 1024 hex chars
+                                .map(|b| format!("{b:02x}"))
+                                .collect();
+                            let _ = writeln!(
+                                fullcap_log,
+                                "{}",
+                                serde_json::json!({
+                                    "n": fullcap_count,
+                                    "ts": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                                    "cmd": command.command_id,
+                                    "len": command.proto_data.len(),
+                                    "hex": hex,
+                                })
+                            );
                         }
 
                         // UID voting (avatar-scene) — identifies the account in-game.

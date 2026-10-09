@@ -660,6 +660,34 @@ mod tests {
         assert_eq!(r.goal, 180);
     }
 
+    /// Real captured named entity: Moon_PhysicsGadget.
+    #[test]
+    fn detects_named_entity() {
+        let cmd = cmd_from_hex(23737,
+            "32124d6f6f6e5f5068797369637347616467657450bd8180046801");
+        let ne = detect_named_entity(&cmd).expect("should detect");
+        assert_eq!(ne.name, "Moon_PhysicsGadget");
+        assert!(ne.entity_id > 8_000_000);
+        assert_eq!(ne.action, 1);
+    }
+
+    /// Real captured named entity: ARKHE_GADGET (Fontaine).
+    #[test]
+    fn detects_named_entity_arkhe() {
+        let cmd = cmd_from_hex(23737,
+            "320c41524b48455f47414447455450ff8480046801");
+        let ne = detect_named_entity(&cmd).expect("should detect");
+        assert_eq!(ne.name, "ARKHE_GADGET");
+    }
+
+    /// Real captured named entity: WB46 (short name, Bygone Sea).
+    #[test]
+    fn detects_named_entity_short() {
+        let cmd = cmd_from_hex(23737, "320457423436508e818004");
+        let ne = detect_named_entity(&cmd).expect("should detect");
+        assert_eq!(ne.name, "WB46");
+    }
+
     /// Real captured cmd-26016 payload with the player near Windwail statue —
     /// the verified direct carrier (trajectory-confirmed, 460/460 consistent).
     #[test]
@@ -730,6 +758,47 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(600));
         assert!(t.accept(110.0, 200.0, 300.0));
     }
+}
+
+/// Named entity notification (cmd 23737 in 7.x): carries entity type
+/// names as readable strings alongside entity IDs.
+///
+/// Shape: `{6: "EntityTypeName", 10: entity_id, 13: action}` where action=1
+/// is spawn/state-change. Observed names: Moon_PhysicsGadget,
+/// ARKHE_GADGET, FauneAbyssale_AbilityAnimal, UnintelligentRobot_SearchLight,
+/// IS_LMS_WHALE_SCAN_TARGET, Remus_Mixe, _Transfer_Vehicle, etc.
+#[derive(Debug, Clone)]
+pub struct NamedEntity {
+    pub name: String,
+    pub entity_id: u64,
+    pub action: u32,
+}
+
+pub fn detect_named_entity(cmd: &GameCommand) -> Option<NamedEntity> {
+    let d = &cmd.proto_data;
+    if d.is_empty() || d.len() > 128 {
+        return None;
+    }
+    let fields = parse(d)?;
+
+    let name_bytes = fields.iter()
+        .find(|(f, _)| *f == 6)
+        .and_then(|(_, v)| v.as_bytes())?;
+    let name = String::from_utf8_lossy(name_bytes);
+    if name.len() < 3 || !name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+
+    let entity_id = fields.iter()
+        .find(|(f, _)| *f == 10)
+        .and_then(|(_, v)| v.as_varint())?;
+
+    let action = fields.iter()
+        .find(|(f, _)| *f == 13)
+        .and_then(|(_, v)| v.as_varint())
+        .unwrap_or(0) as u32;
+
+    Some(NamedEntity { name: name.into_owned(), entity_id, action })
 }
 
 /// Detects an oculus gadget config id (107001..=107008, Anemoculus..Lunoculus)
