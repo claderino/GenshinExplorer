@@ -50,6 +50,10 @@ pub struct Pin {
     pub label_id: u32,
     pub x: f64, // original map pixel coords
     pub y: f64,
+    /// Per-pin floor membership from the API (`point_group` field:
+    /// {group_id, floor_id}). Authoritative and a strict superset of
+    /// the floor-level `point_ids` lists.
+    pub point_group: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -244,6 +248,11 @@ fn parse(json: &serde_json::Value, map_id: u32, cache_dir: &Path) -> Result<PinD
             label_id: p.get("label_id")?.as_u64()? as u32,
             x: p.get("x_pos")?.as_f64()?,
             y: p.get("y_pos")?.as_f64()?,
+            point_group: p.get("point_group").and_then(|v| {
+                let g = v.get("group_id").and_then(|x| x.as_u64())? as u32;
+                let f = v.get("floor_id").and_then(|x| x.as_u64())? as u32;
+                Some((g, f))
+            }),
         })
     }).collect();
 
@@ -323,7 +332,31 @@ fn parse(json: &serde_json::Value, map_id: u32, cache_dir: &Path) -> Result<PinD
 
     let index = PinIndex::new(&pins, 256.0);
     let pin_label: HashMap<u64, u32> = pins.iter().map(|p| (p.id, p.label_id)).collect();
-    let floors = load_point_groups(map_id, cache_dir);
+    let mut floors = load_point_groups(map_id, cache_dir);
+    // Merge the per-pin point_group membership into the floors' point_ids.
+    // The API's floor-level point_ids lists are INCOMPLETE: measured
+    // against the per-pin field, 537 marked-but-unlisted pins on Teyvat
+    // and 25 on the moon — without the merge those render on the surface
+    // view even though HoYoLab shows them on the floor.
+    let mut merged = 0usize;
+    for p in &pins {
+        if let Some((g, f)) = p.point_group {
+            if let Some(floor) = floors
+                .iter_mut()
+                .find(|fl| fl.group_id == g && fl.floor_id == f)
+            {
+                if floor.point_ids.insert(p.id) {
+                    merged += 1;
+                }
+            }
+        }
+    }
+    if merged > 0 {
+        tracing::info!(
+            merged,
+            "per-pin point_group membership merged into floors"
+        );
+    }
 
     tracing::info!(
         map_id, pins = pins.len(), labels = label_entries.len(),
