@@ -473,7 +473,12 @@ impl MapWindow {
                 self.pending_layer = None;
                 self.active_layer = None;
                 self.active_floor = None;
-                self.floor_locked = false;
+                // Lock SURFACE: the default-layer report is authoritative
+                // (the minimap switched outdoors). Without the lock the
+                // rect auto-follow would immediately re-select the floor
+                // we just left — the layer boundary sits INSIDE the
+                // overlay rect, so containment still matches at exit.
+                self.floor_locked = true;
             }
             Some(id) => {
                 self.pending_layer = Some(id);
@@ -1585,7 +1590,8 @@ impl MapWindow {
                         self.learned_layers_dirty = learned_dirty;
                         if let Some(sel) = apply_active {
                             self.active_floor = sel;
-                            self.floor_locked = sel.is_some();
+                            // Lock whatever was taught — floor or surface.
+                            self.floor_locked = true;
                         }
                     }
 
@@ -1812,10 +1818,12 @@ impl MapWindow {
                     }
 
                     // Floor (layer) selection: manual override from the
-                    // sidebar combobox — locks out auto-follow.
+                    // sidebar combobox — locks out auto-follow (a manual
+                    // Surface pick sticks too; rect containment must not
+                    // fight an explicit choice).
                     if let Some(sel) = floor_select {
                         self.active_floor = sel;
-                        self.floor_locked = sel.is_some();
+                        self.floor_locked = true;
                     }
 
                     // Lazy-load the active floor's overlay texture.
@@ -2250,7 +2258,10 @@ impl MapWindow {
                                         "map layer {layer_id} → surface"
                                     );
                                     self.active_floor = None;
-                                    self.floor_locked = false;
+                                    // Lock surface — same reasoning as the
+                                    // default-layer report: the packet
+                                    // outranks rect containment.
+                                    self.floor_locked = true;
                                     self.pending_layer = None;
                                 } else if let Some(fi) = resolved {
                                     tracing::info!(
@@ -2510,6 +2521,8 @@ impl MapWindow {
                 self.selected = None;              // close popup
                 self.active_floor = None;
                 self.pending_layer = None;         // layer ids are map-scoped
+                self.active_layer = None;
+                self.floor_locked = false;         // surface locks don't carry over
                 self.floor_overlays.clear();
                 let (off, scale, pts) = Self::load_calibration(id);
                 self.calibrate_offset = off;
