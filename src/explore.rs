@@ -409,16 +409,38 @@ pub fn detect_challenge_result(cmd: &GameCommand) -> Option<ChallengeResult> {
     }
 }
 
-/// Region-feature broadcast (cmd 6771 in 7.x): `{3: 1, 9: 1, 10: "<name>",
-/// 12: rule_id, …}` repeating ~1 Hz while inside special regions.
+/// Region-feature broadcast (cmd 6771 = RegionalPlayInfoNotify):
+/// `{3: 1, 9: 1, 10: "<name>", 12: rule_id, …}` repeating ~1–2 Hz while
+/// inside special regions.
 /// Observed names: "LightStone" (Chasm), "MoonFatigue" (Frost Moon /
 /// Nod-Krai); plain Teyvat sends nothing.
-pub fn region_feature(buf: &[u8]) -> Option<String> {
+///
+/// Two shapes were observed in 7.1 captures:
+///  * **periodic** — field 9 present (value 1), full payload. Repeats
+///    ~1–2 Hz while the player is inside the region.
+///  * **straggler** — field 9 absent, payload 2 bytes shorter. Sent
+///    exactly once, right as the player *leaves* the region (observed
+///    after both moon→Chasm and Chasm→surface transitions). These must
+///    not switch the map or refresh the broadcast-silence timer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegionFeature {
+    pub name: String,
+    /// True when field 9 is present (the periodic in-region shape).
+    pub periodic: bool,
+}
+
+pub fn region_feature(buf: &[u8]) -> Option<RegionFeature> {
     if buf.is_empty() || buf.len() > 96 {
         return None;
     }
     let fields = parse(buf)?;
+    let mut periodic = false;
     for (f, v) in &fields {
+        if *f == 9 {
+            // Any presence of field 9 marks the periodic shape; observed
+            // value is varint 1.
+            periodic = matches!(v, Value::Varint(_));
+        }
         if *f != 10 { continue; }
         let Some(bytes) = v.as_bytes() else { continue };
         if bytes.len() < 4 || bytes.len() > 24 {
@@ -426,7 +448,10 @@ pub fn region_feature(buf: &[u8]) -> Option<String> {
         }
         let s = String::from_utf8_lossy(bytes);
         if s.chars().all(|c| c.is_ascii_alphanumeric()) {
-            return Some(s.into_owned());
+            return Some(RegionFeature {
+                name: s.into_owned(),
+                periodic,
+            });
         }
     }
     None
@@ -590,6 +615,54 @@ mod tests {
         assert_eq!(gr.action_reason, Some(39));
         assert_eq!(gr.id, 202);
         assert_eq!(gr.count, Some(780));
+    }
+
+    /// Real captured periodic MoonFatigue broadcast (6771): field 9 present.
+    #[test]
+    fn detects_periodic_region_broadcast() {
+        let rf = region_feature(
+            &hex("18014801520b4d6f6f6e46617469677565620828ac347d0000c84278ac34"),
+        )
+        .expect("should parse");
+        assert_eq!(rf.name, "MoonFatigue");
+        assert!(rf.periodic);
+    }
+
+    /// Real captured straggler MoonFatigue (6771): field 9 absent — sent
+    /// once right as the player leaves the region; must not be periodic.
+    #[test]
+    fn detects_straggler_region_broadcast() {
+        let rf = region_feature(
+            &hex("1801520b4d6f6f6e46617469677565620828ac347d0000c84278ac34"),
+        )
+        .expect("should parse");
+        assert_eq!(rf.name, "MoonFatigue");
+        assert!(!rf.periodic);
+    }
+
+    /// Real captured periodic + straggler LightStone (Chasm) pair.
+    #[test]
+    fn detects_lightstone_periodic_and_straggler() {
+        let periodic = region_feature(
+            &hex("18014801520a4c6967687453746f6e65620328a81478a814"),
+        )
+        .expect("should parse");
+        assert_eq!(periodic.name, "LightStone");
+        assert!(periodic.periodic);
+
+        let straggler = region_feature(
+            &hex("1801520a4c6967687453746f6e65620328a81478a814"),
+        )
+        .expect("should parse");
+        assert_eq!(straggler.name, "LightStone");
+        assert!(!straggler.periodic);
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     /// Real captured oculus state change: cmd 652 with config 107001.

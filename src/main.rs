@@ -189,6 +189,7 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
         // Region-feature tracking (6771 broadcasts) → active region map.
         let mut region_feature_at: Option<(String, std::time::Instant)> = None;
         let mut active_region: Option<u32> = None;
+        let mut first_position_at: Option<std::time::Instant> = None;
         // Big packets (>1 KB) only fire on real scene changes (enter-scene
         // notifies) — distinguishes the Chasm underground (scene change)
         // from its surface (same scene as Teyvat).
@@ -346,65 +347,107 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                             );
                         }
 
-                        // Region features (6771 shape): periodic broadcast
-                        // naming the special region the player is inside.
+                        // Region features (6771 = RegionalPlayInfoNotify):
+                        // periodic broadcast naming the special region the
+                        // player is inside. Stragglers (field 9 absent) are
+                        // sent once on *leaving* a region — ignored so they
+                        // can't switch the map or refresh the silence timer.
                         if command.proto_data.len() <= 96 {
-                            if let Some(name) =
+                            if let Some(rf) =
                                 explore::region_feature(&command.proto_data)
                             {
-                                let scene_change = last_big_packet
-                                    .map(|t| {
-                                        t.elapsed() < Duration::from_secs(15)
-                                    })
-                                    .unwrap_or(false);
-                                let map_id = match name.as_str() {
-                                    // Chasm: only the underground mines are a
-                                    // separate scene — the surface shares
-                                    // Teyvat's scene and must stay on map 2.
-                                    "LightStone" if scene_change => Some(9u32),
-                                    "LightStone" => {
-                                        tracing::debug!(
-                                            "LightStone (surface) — staying on Teyvat"
-                                        );
-                                        None
-                                    }
-                                    // Nod-Krai is its own scene; every entry
-                                    // is a scene change anyway.
-                                    "MoonFatigue" => Some(40u32),
-                                    _ => {
-                                        tracing::info!("unknown region feature: {name}");
-                                        None
-                                    }
-                                };
-                                region_feature_at =
-                                    Some((name, std::time::Instant::now()));
-                                if let Some(id) = map_id {
-                                    if active_region != Some(id) {
-                                        active_region = Some(id);
-                                        let _ = tx.send(Msg::Region(id));
+                                if !rf.periodic {
+                                    tracing::debug!(
+                                        "region straggler '{}' — ignoring",
+                                        rf.name
+                                    );
+                                } else {
+                                    let scene_change = last_big_packet
+                                        .map(|t| {
+                                            t.elapsed()
+                                                < Duration::from_secs(15)
+                                        })
+                                        .unwrap_or(false);
+                                    let map_id = match rf.name.as_str() {
+                                        // Chasm: only the underground mines
+                                        // are a separate scene — the surface
+                                        // shares Teyvat's scene and must
+                                        // stay on map 2.
+                                        "LightStone" if scene_change => {
+                                            Some(9u32)
+                                        }
+                                        "LightStone" => {
+                                            tracing::debug!(
+                                                "LightStone (surface) — \
+                                                 staying on Teyvat"
+                                            );
+                                            None
+                                        }
+                                        // Nod-Krai is its own scene; every
+                                        // entry is a scene change anyway.
+                                        "MoonFatigue" => Some(40u32),
+                                        _ => {
+                                            tracing::info!(
+                                                "unknown region feature: {}",
+                                                rf.name
+                                            );
+                                            None
+                                        }
+                                    };
+                                    region_feature_at = Some((
+                                        rf.name,
+                                        std::time::Instant::now(),
+                                    ));
+                                    if let Some(id) = map_id {
+                                        if active_region != Some(id) {
+                                            active_region = Some(id);
+                                            let _ =
+                                                tx.send(Msg::Region(id));
+                                        }
                                     }
                                 }
                             }
                         }
                         // Broadcast silence → back on the main map. Only
                         // while the game is actively running (position
-                        // updates flowing) — the world pauses with the
-                        // in-game map open, which silences broadcasts too.
-                        if active_region.is_some_and(|r| r != 2)
-                            && region_feature_at
-                                .as_ref()
-                                .map(|(_, t)| {
-                                    t.elapsed() >= Duration::from_secs(15)
-                                })
-                                .unwrap_or(true)
+                        // updates flowing). Also fires when active_region
+                        // is None (app restart with no region seen yet):
+                        // a 6 s grace from the first position fix lets a
+                        // sub-map's periodic broadcast (~1 Hz, e.g.
+                        // MoonFatigue) arrive before defaulting to the
+                        // surface map.
+                        let needs_surface = match active_region {
+                            Some(r) => r != 2,
+                            None => true, // default to surface when unknown
+                        };
+                        let broadcast_silent = region_feature_at
+                            .as_ref()
+                            .map(|(_, t)| {
+                                // Periodic broadcasts repeat at 1–2 Hz, so
+                                // 8 s of silence while positions keep
+                                // flowing means the region was left.
+                                t.elapsed() >= Duration::from_secs(8)
+                            })
+                            .unwrap_or_else(|| {
+                                first_position_at
+                                    .map(|t| {
+                                        t.elapsed()
+                                            >= Duration::from_secs(6)
+                                    })
+                                    .unwrap_or(false)
+                            });
+                        if needs_surface
+                            && broadcast_silent
                             && last_position_at
                                 .map(|t| {
                                     t.elapsed() < Duration::from_secs(8)
                                 })
                                 .unwrap_or(false)
                         {
-                            active_region = Some(2);
-                            let _ = tx.send(Msg::Region(2));
+                            if active_region != Some(2) {
+                                active_region = Some(2);
+                                let _ = tx.send(Msg::Region(2));
+                            }
                         }
 
                         // Scene-transition capture window: log every command.
@@ -629,6 +672,10 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                             if pos_tracker.accept(motion.x, motion.y, motion.z) {
                                 let (px, py, pz) = pos_tracker.last.unwrap();
                                 last_position_at = Some(std::time::Instant::now());
+                                if first_position_at.is_none() {
+                                    first_position_at =
+                                        Some(std::time::Instant::now());
+                                }
                                 // Scene-transition capture: a big jump = teleport
                                 // (possibly cross-scene). Log everything for 2.5 s.
                                 if let Some((lx, lz)) = last_sent_pos {
