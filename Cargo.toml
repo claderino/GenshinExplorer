@@ -1,0 +1,38 @@
+[package]
+name = "genshin-explorer"
+version = "0.1.0"
+edition = "2024"
+description = "Live world tracking (player position, chests, loot) from Genshin Impact network traffic"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+aes-gcm = "0.10"
+auto-artifactarium = { path = "vendor/auto-artifactarium" }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+eframe = "0.32"
+egui_extras = "0.32"
+futures = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+pktmon = { version = "0.6.2", features = ["tokio"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ureq = { version = "2", features = ["json", "tls"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = 2

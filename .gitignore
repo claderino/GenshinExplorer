@@ -1,0 +1,38 @@
+# Build output
+/target
+
+# Packet capture logs and local data (may contain positions, UID, timing)
+*.jsonl
+data/
+
+# Runtime-generated caches and calibration (contains per-account data
+# synced from LOCALAPPDATA during development — not for the repo)
+*.cache/
+calibration/
+
+# OS artifacts
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment / secrets (never commit)
+.env
+.env.*
+*.pem
+*.key
+credentials*.json
+
+# HoYoLab cookie profiles (DPAPI-encrypted, per-machine)
+hoyolab_profiles.json
+
+# Dispatch keys — game protocol decryption seeds (publicly known,
+# derived from the game client, NOT user credentials).
+# Uncomment to exclude if you prefer:
+# keys/
