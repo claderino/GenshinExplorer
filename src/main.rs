@@ -712,6 +712,19 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                     first_position_at =
                                         Some(std::time::Instant::now());
                                 }
+                                // First position fix of the session (game
+                                // login, or the app starting mid-session):
+                                // there is no previous position, so no
+                                // teleport can be detected — but the
+                                // arrival still deserves floor selection.
+                                // Emit a synthetic arrival so the waypoint
+                                // pin-match picks the floor of the
+                                // teleporter you spawned next to.
+                                if last_sent_pos.is_none() {
+                                    let _ = tx.send(Msg::TeleportArrival {
+                                        x: px, y: py, z: pz, dy: 0.0,
+                                    });
+                                }
                                 // Teleport: a big x-z jump OR a big height
                                 // jump. Layered teleports (stacked floors)
                                 // can land within a few units in x-z while
