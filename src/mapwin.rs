@@ -373,6 +373,25 @@ pub struct MapWindow {
     auto_notes: Vec<(String, std::time::Instant)>,
 }
 
+/// Embedded defaults — calibration + learned layer mappings captured by
+/// the primary user on 2026-10-09 (game 7.1). Give fresh installs a
+/// working dot and layer tracking out of the box; user files override.
+mod defaults {
+    pub const LEARNED_LAYERS: &str =
+        include_str!("../defaults/learned_map_layers.json");
+    pub fn calibration(map_id: u32) -> Option<&'static str> {
+        Some(match map_id {
+            7 => include_str!("../defaults/map_calibration_7.json"),
+            9 => include_str!("../defaults/map_calibration_9.json"),
+            34 => include_str!("../defaults/map_calibration_34.json"),
+            36 => include_str!("../defaults/map_calibration_36.json"),
+            37 => include_str!("../defaults/map_calibration_37.json"),
+            40 => include_str!("../defaults/map_calibration_40.json"),
+            _ => return None,
+        })
+    }
+}
+
 impl MapWindow {
     pub fn new() -> Self {
         let selected_map = 2;
@@ -586,12 +605,29 @@ impl MapWindow {
         u32,
         std::collections::HashMap<u64, (u32, u32)>,
     > {
-        let Ok(text) = std::fs::read_to_string(Self::learned_layers_path())
-        else {
-            return std::collections::HashMap::new();
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-            return std::collections::HashMap::new();
+        // Embedded defaults first, then the user's file overlays per
+        // entry (their corrections/discoveries win; new entries add).
+        let mut out = Self::parse_learned_layers(defaults::LEARNED_LAYERS);
+        if let Ok(text) =
+            std::fs::read_to_string(Self::learned_layers_path())
+        {
+            let user = Self::parse_learned_layers(&text);
+            for (map_id, entries) in user {
+                out.entry(map_id).or_default().extend(entries);
+            }
+        }
+        out
+    }
+
+    fn parse_learned_layers(
+        text: &str,
+    ) -> std::collections::HashMap<
+        u32,
+        std::collections::HashMap<u64, (u32, u32)>,
+    > {
+        let mut out = std::collections::HashMap::new();
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+            return out;
         };
         let mut out = std::collections::HashMap::new();
         if let Some(maps) = v.as_object() {
@@ -661,12 +697,20 @@ impl MapWindow {
             Vec<Option<(u32, u32)>>,
         )
     {
-        let Ok(text) = std::fs::read_to_string(
+        // User file first; embedded default when absent (a deliberately
+        // cleared calibration writes an empty file, which is present and
+        // therefore wins over the default).
+        let user = std::fs::read_to_string(
             Self::calibration_path(map_id).unwrap_or_default(),
-        ) else {
-            return (None, None, Vec::new(), Vec::new());
+        );
+        let text: &str = match (&user, defaults::calibration(map_id)) {
+            (Ok(t), _) => t,
+            (Err(_), Some(d)) => d,
+            (Err(_), None) => {
+                return (None, None, Vec::new(), Vec::new())
+            }
         };
-        let Ok(j) = serde_json::from_str::<serde_json::Value>(&text) else {
+        let Ok(j) = serde_json::from_str::<serde_json::Value>(text) else {
             return (None, None, Vec::new(), Vec::new());
         };
         let g = |k: &str| j.get(k).and_then(|v| v.as_f64());
