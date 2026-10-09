@@ -20,3 +20,17 @@ jobs:
 
       - name: Tests
         run: cargo test --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $rev = "$env:GITHUB_SHA".Substring(0,7)
+          $zip = "genshin-explorer-$rev-x86_64-windows.zip"
+          Compress-Archive -Path target/release/genshin-explorer.exe -DestinationPath $zip
+          "zip=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.zip }}
+          path: ${{ env.zip }}
