@@ -238,6 +238,14 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
             .append(true)
             .open(data_dir.join("fullcap.jsonl"))?;
         let mut fullcap_count: u64 = 0;
+        // Token-exchange dump: the 7.1 new-format handshake is not
+        // decryptable with the current dispatch keys — persist the FULL
+        // Req/Rsp payloads (untruncated) so the key exchange can be
+        // analyzed offline.
+        let mut token_log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(data_dir.join("token_exchange.jsonl"))?;
 
         let mut last_pos_write: HashMap<u64, std::time::Instant> = HashMap::new();
 
@@ -527,6 +535,31 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                 "{}",
                                 serde_json::json!({
                                     "n": fullcap_count,
+                                    "ts": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                                    "cmd": command.command_id,
+                                    "name": cmd_names::command_name(command.command_id),
+                                    "len": command.proto_data.len(),
+                                    "hex": hex,
+                                })
+                            );
+                        }
+
+                        // Token exchange (GetPlayerTokenReq/Rsp): dump the
+                        // FULL untruncated payload — the new-format 7.1
+                        // handshake (~19.9 KB Rsp vs the old ~25.5 KB) is
+                        // undecryptable with current keys and needs offline
+                        // analysis of its key blobs.
+                        if command.command_id == 23252 || command.command_id == 3713 {
+                            use std::io::Write;
+                            let hex: String = command
+                                .proto_data
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect();
+                            let _ = writeln!(
+                                token_log,
+                                "{}",
+                                serde_json::json!({
                                     "ts": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                                     "cmd": command.command_id,
                                     "name": cmd_names::command_name(command.command_id),
