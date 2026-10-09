@@ -88,9 +88,37 @@ fn main() -> Result<()> {
     eframe::run_native(
         "GenshinExplorer",
         options,
-        Box::new(move |_cc| Ok(Box::new(ExplorerApp::new(rx)))),
+        Box::new(move |cc| {
+            install_emoji_font(&cc.egui_ctx);
+            Ok(Box::new(ExplorerApp::new(rx)))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("GUI error: {e}"))
+}
+
+/// egui's bundled fonts have no emoji coverage — most of the UI's
+/// pictographs (📍 🗺 🗂 🧲 …) would render as tofu boxes. Register the
+/// monochrome Noto Emoji as a fallback for both font families.
+/// (Color emoji fonts aren't supported by epaint's rasterizer.)
+fn install_emoji_font(ctx: &egui::Context) {
+    const NOTO_EMOJI: &[u8] =
+        include_bytes!("../assets/NotoEmoji-Regular.ttf");
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "noto-emoji".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(NOTO_EMOJI)),
+    );
+    for family in [
+        egui::FontFamily::Proportional,
+        egui::FontFamily::Monospace,
+    ] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("noto-emoji".to_owned());
+    }
+    ctx.set_fonts(fonts);
 }
 
 fn load_keys() -> Result<HashMap<u16, Vec<u8>>> {
