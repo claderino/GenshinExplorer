@@ -2970,11 +2970,11 @@ impl MapWindow {
                search: &mut String) {
         ui.heading("📋 Pin Filters");
         if ui.checkbox(&mut filter.hide_completed, "Hide collected").changed() { *changed = true; }
-        if ui.checkbox(&mut filter.flatten_layers, "All pins on surface")
+        if ui.checkbox(&mut filter.flatten_layers, "Show all layers' pins")
             .on_hover_text(
-                "Show floor/underground pins on the surface view too \
-                 (like HoYoLab). Floor views keep showing their own \
-                 layers.")
+                "Ignore layer partitioning: every pin renders fully \
+                 opaque on every view. Off = surface view shows only \
+                 surface pins, floor views only their active floor.")
             .changed()
         { *changed = true; }
         ui.horizontal(|ui| {
@@ -3311,13 +3311,12 @@ impl MapWindow {
             // Candidates for click hit-testing.
             let mut hit: Option<(f32, u64, u32, egui::Pos2)> = None; // (dist², id, label, pos)
 
-            // Render-stack membership: surface pins always show (dimmed
-            // under an active floor); floor pins show for every stack
-            // member — dimmed except the active floor.
-            let stack_ids: std::collections::HashSet<u64> = active_floor
-                .iter()
-                .flat_map(|(f, _, _)| f.point_ids.iter().copied())
-                .collect();
+            // Pin visibility: pins are fully opaque or hidden — dimming
+            // is reserved for map imagery (base map + shallow overlays).
+            // Floor views show ONLY the active floor's pins; the surface
+            // view shows only surface pins. The flatten toggle disables
+            // layer partitioning entirely (everything, everywhere,
+            // fully opaque).
             let active_ids: Option<&std::collections::HashSet<u64>> =
                 active_floor
                     .iter()
@@ -3327,21 +3326,20 @@ impl MapWindow {
             for idx in vis {
                 let pin = &pd.pins[idx];
                 if !filter.is_enabled(pin.label_id) { continue; }
-                // Floor (layer) pin partitioning by the render stack.
-                // With flatten_layers and no active floor (surface view),
-                // every pin shows — the all-layers display like HoYoLab.
                 let in_any_floor = pd.floors.iter()
                     .any(|f| f.point_ids.contains(&pin.id));
-                if !filter.flatten_layers || !active_floor.is_empty() {
-                    if in_any_floor && !stack_ids.contains(&pin.id) { continue; }
+                if !filter.flatten_layers {
+                    if active_floor.is_empty() {
+                        // Surface view: surface pins only.
+                        if in_any_floor { continue; }
+                    } else {
+                        // Floor view: only the active floor's pins —
+                        // surface and other layers' pins are hidden.
+                        if !active_ids.is_some_and(|s| s.contains(&pin.id)) {
+                            continue;
+                        }
+                    }
                 }
-                let layer_dim = if active_floor.is_empty() {
-                    false // surface view (flattened pins show undimmed)
-                } else if !in_any_floor {
-                    true // surface under an active floor
-                } else {
-                    !active_ids.is_some_and(|s| s.contains(&pin.id))
-                };
                 let done = completed.contains(&pin.id);
                 if done && filter.hide_completed { continue; }
                 total_vis += 1;
@@ -3366,8 +3364,6 @@ impl MapWindow {
                     }
                     let tint = if done {
                         egui::Color32::from_rgba_unmultiplied(255,255,255,90)
-                    } else if layer_dim {
-                        egui::Color32::from_rgba_unmultiplied(255,255,255,120)
                     } else {
                         egui::Color32::WHITE
                     };
