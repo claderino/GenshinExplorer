@@ -562,6 +562,10 @@ pub struct FilterState {
     pub enabled_labels: std::collections::HashSet<u32>,
     /// When true, collected pins are hidden entirely; otherwise they fade.
     pub hide_completed: bool,
+    /// When true, the surface view also shows floor/underground pins
+    /// (like HoYoLab's all-layers display); floor views are unaffected.
+    #[serde(default)]
+    pub flatten_layers: bool,
 }
 
 impl FilterState {

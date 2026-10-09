@@ -2778,6 +2778,13 @@ impl MapWindow {
                search: &mut String) {
         ui.heading("📋 Pin Filters");
         if ui.checkbox(&mut filter.hide_completed, "Hide collected").changed() { *changed = true; }
+        if ui.checkbox(&mut filter.flatten_layers, "All pins on surface")
+            .on_hover_text(
+                "Show floor/underground pins on the surface view too \
+                 (like HoYoLab). Floor views keep showing their own \
+                 layers.")
+            .changed()
+        { *changed = true; }
         ui.horizontal(|ui| {
             // Fixed width: available_width() in an auto-sized side panel is
             // the whole screen, which would stretch the panel.
@@ -3122,11 +3129,15 @@ impl MapWindow {
                 let pin = &pd.pins[idx];
                 if !filter.is_enabled(pin.label_id) { continue; }
                 // Floor (layer) pin partitioning by the render stack.
+                // With flatten_layers and no active floor (surface view),
+                // every pin shows — the all-layers display like HoYoLab.
                 let in_any_floor = pd.floors.iter()
                     .any(|f| f.point_ids.contains(&pin.id));
-                if in_any_floor && !stack_ids.contains(&pin.id) { continue; }
+                if !filter.flatten_layers || !active_floor.is_empty() {
+                    if in_any_floor && !stack_ids.contains(&pin.id) { continue; }
+                }
                 let layer_dim = if active_floor.is_empty() {
-                    false // pure surface view
+                    false // surface view (flattened pins show undimmed)
                 } else if !in_any_floor {
                     true // surface under an active floor
                 } else {
