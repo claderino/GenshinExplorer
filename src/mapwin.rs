@@ -2256,36 +2256,64 @@ impl MapWindow {
                         }
                     }
 
-                    // Auto-switch sub-map: when the player's position (with
-                    // height sanity for underground maps) stays inside another
-                    // map's canvas for 5 s, switch to it. Stands down while a
-                    // region broadcast (packets) is authoritative.
-                    // (Gated by 🗺 auto only — 📍 follow is just the camera.)
-                    if self.auto_map && self.region_lock.is_none()
+                    // Auto-switch sub-map (geometric): candidates are
+                    // restricted to the current WORLD FRAME. The moon
+                    // frame ({36, 37, 40}) shares one coordinate space
+                    // and ONE region broadcast (MoonFatigue) — its
+                    // sub-maps are distinguished by canvas containment,
+                    // smallest box wins (Temple of Space ⊂ Ancient
+                    // Sacred Mountain ⊂ Frost Moon, so first-match
+                    // ordering would confuse them). The Teyvat frame
+                    // ({2, 7, 9, 34}) keeps the underground height
+                    // guard; moon-frame boxes overlap Teyvat
+                    // coordinates, so they must never be candidates
+                    // while in the Teyvat frame.
+                    // (Gated by 🗺 auto only — 📍 follow is just the
+                    // camera. MoonFatigue does NOT stand down here — it
+                    // covers the whole moon world, and its sub-maps can
+                    // only be told apart geometrically.)
+                    let moon_world = self.region_lock == Some(40);
+                    if self.auto_map
+                        && (self.region_lock.is_none() || moon_world)
                         && player.is_some()
                     {
                         let (px, py, pz) = player.unwrap();
-                        let mut candidate: Option<u32> = None;
+                        // Best (smallest containing) canvas in the
+                        // current frame, INCLUDING the selected map —
+                        // nested canvases must not switch away.
+                        let mut best: Option<(f64, u32)> = None;
                         for (mid, _) in pins::available_maps() {
-                            if mid == self.selected_map { continue; }
-                            // Map 40 (the moon) is a separate WORLD: its
-                            // canvas box overlaps Teyvat coordinates, and
-                            // height can't discriminate it — region packets
-                            // (MoonFatigue) own it exclusively.
-                            if mid == 40 { continue; }
+                            let in_moon_frame =
+                                matches!(mid, 36 | 37 | 40);
+                            if in_moon_frame != moon_world { continue; }
                             // Underground maps need a height sanity check.
-                            if matches!(mid, 7 | 9 | 34) && py > 50.0 { continue; }
-                            if let Some((origin, total)) = Self::cached_map_extent(mid) {
+                            if !moon_world
+                                && matches!(mid, 7 | 9 | 34)
+                                && py > 50.0
+                            {
+                                continue;
+                            }
+                            if let Some((origin, total)) =
+                                Self::map_frame_extent(mid)
+                            {
                                 let mx = origin.0 - pz as f64;
                                 let my = origin.1 - px as f64;
                                 if (0.0..=total.0).contains(&mx)
                                     && (0.0..=total.1).contains(&my)
                                 {
-                                    candidate = Some(mid);
-                                    break;
+                                    let area = total.0 * total.1;
+                                    if best
+                                        .map(|(a, _)| area < a)
+                                        .unwrap_or(true)
+                                    {
+                                        best = Some((area, mid));
+                                    }
                                 }
                             }
                         }
+                        let candidate = best
+                            .filter(|(_, mid)| *mid != self.selected_map)
+                            .map(|(_, mid)| mid);
                         match (candidate, self.auto_switch_pending) {
                             (Some(mid), Some((pmid, since))) if mid == pmid => {
                                 if since.elapsed().as_secs_f32() >= 5.0 {
@@ -2943,6 +2971,25 @@ impl MapWindow {
             Some((arr[0].as_f64()?, arr[1].as_f64()?))
         };
         Some((a("origin")?, a("total_size")?))
+    }
+
+    /// Map extent for frame-matching, with builtin fallbacks (detail_v2
+    /// values as served by the API on 2026-10-09) for maps whose info
+    /// isn't cached locally yet.
+    fn map_frame_extent(map_id: u32)
+        -> Option<((f64, f64), (f64, f64))> {
+        Self::cached_map_extent(map_id).or_else(|| {
+            Some(match map_id {
+                2 => ((24206.0, 8918.0), (36864.0, 18432.0)),
+                7 => ((1849.0, 1779.0), (4096.0, 4096.0)),
+                9 => ((2016.0, 1956.0), (4096.0, 4096.0)),
+                34 => ((2144.0, 2140.0), (4096.0, 4096.0)),
+                36 => ((2200.0, 1823.0), (4096.0, 4096.0)),
+                37 => ((1515.0, 1416.0), (3072.0, 3072.0)),
+                40 => ((2617.0, 4155.0), (10240.0, 8192.0)),
+                _ => return None,
+            })
+        })
     }
 
     /// Combo box for map selection; returns Some(map_id) when changed.

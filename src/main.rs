@@ -236,6 +236,12 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
         let mut last_position_at: Option<std::time::Instant> = None;
         let mut last_pos_change_at: Option<std::time::Instant> = None;
         let mut last_chest_send: Option<std::time::Instant> = None;
+        // Armed by WorldChestOpenNotify (28616); resolved by the ItemAdd
+        // chest path, or sent as a Mora-less fallback after 2.5 s.
+        let mut pending_world_chest: Option<(
+            (f32, f32, f32),
+            std::time::Instant,
+        )> = None;
         // Full research capture: ALL decrypted commands, any size, first
         // 1KB of hex. No count limit — for targeted analysis sessions.
         let mut fullcap_log = std::fs::OpenOptions::new()
@@ -274,6 +280,43 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                         let _ = tx.send(Msg::Info("Tracking — decrypting game traffic".into()));
                     }
                     for command in &commands {
+                        // WorldChestOpenNotify fallback resolution: armed by
+                        // the dedicated chest-open packet, normally resolved
+                        // within milliseconds by the ItemAdd chest path
+                        // (which knows the Mora amount). If no ItemAdd
+                        // arrives, the chest still gets marked.
+                        if let Some((pos, since)) = pending_world_chest {
+                            if since.elapsed()
+                                >= Duration::from_millis(2500)
+                            {
+                                pending_world_chest = None;
+                                let (x, y, z) = pos;
+                                {
+                                    use std::io::Write;
+                                    let _ = writeln!(
+                                        chest_log,
+                                        "{}",
+                                        serde_json::json!({
+                                            "chest": true,
+                                            "ts": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                                            "amount": 0,
+                                            "type_estimate": "world_chest_notify",
+                                            "pos": [x, y, z],
+                                        })
+                                    );
+                                }
+                                let _ = tx.send(Msg::Chest {
+                                    amount: 0,
+                                    x,
+                                    y,
+                                    z,
+                                    kind: "common".into(),
+                                });
+                                last_chest_send =
+                                    Some(std::time::Instant::now());
+                            }
+                        }
+
                         // Command census: counts + a hex sample per id, so
                         // real packet shapes can be derived offline.
                         {
@@ -652,6 +695,9 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                             kind: chest_type.to_string(),
                                         });
                                         last_chest_send = Some(std::time::Instant::now());
+                                        // Satisfied by the ItemAdd path —
+                                        // cancel the 28616 fallback.
+                                        pending_world_chest = None;
                                     }
                                 }
                             }
@@ -700,6 +746,34 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                 pos_tracker.last
                             {
                                 let _ = tx.send(Msg::Oculus { x: px, z: pz });
+                            }
+                        }
+
+                        // WorldChestOpenNotify (28616): the dedicated
+                        // chest-open broadcast `{2: scene_id, 11:
+                        // config_id, 12: group_id}` — no position (the
+                        // player stands at the chest), no ActionReason
+                        // dependency. Arms a pending mark; the ItemAdd
+                        // path (which knows the Mora amount) normally
+                        // resolves it within milliseconds.
+                        if command.command_id == 28616 {
+                            if last_chest_send
+                                .map(|t| {
+                                    t.elapsed()
+                                        >= Duration::from_millis(4000)
+                                })
+                                .unwrap_or(true)
+                            {
+                                if let Some((x, y, z)) = pos_tracker.last {
+                                    tracing::debug!(
+                                        "world chest open — armed pending \
+                                         mark at player position"
+                                    );
+                                    pending_world_chest = Some((
+                                        (x, y, z),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
                             }
                         }
 
