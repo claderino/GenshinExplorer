@@ -1346,7 +1346,7 @@ impl MapWindow {
                                 } else {
                                     Self::match_chest_or_challenge(
                                         &md, pd, &mut self.completed, bucket, xf,
-                                        ev, &self.pos_history,
+                                        ev,
                                         self.active_floor,
                                         &mut self.recent_collected,
                                     )
@@ -3184,7 +3184,6 @@ impl MapWindow {
         completed: &mut HashMap<(u32, u32), std::collections::HashSet<u64>>,
         bucket: u32, xf: Xform,
         ev: &ChestMark,
-        pos_history: &[(f32, f32, std::time::Instant)],
         floor_idx: Option<usize>,
         recent: &mut Vec<(f64, f64, std::time::Instant)>,
     ) -> Option<String> {
@@ -3206,36 +3205,17 @@ impl MapWindow {
             return None;
         }
 
-        let challenge_labels = pd.semantic_labels(PinCategory::Challenges);
+        // NOTE: the old challenge DWELL-ANCHOR rule (any uncollected
+        // challenge pin within 250px of the chest event + player dwell
+        // nearby) is REMOVED — with the exact interact path it's
+        // redundant, and during puzzle-cluster looting it chain-marked
+        // every challenge pin in the vicinity (5 false "Time Trial
+        // completed" in one session). Real challenge completions come
+        // from the 20234 finish notify at the player's position; spawned
+        // reward chests are handled by near_recent_challenge suppression
+        // + the exact interact path.
 
-        // ── Rule 1: challenge dwell anchor ──
-        let cands = pd.index.query(cx - 250.0, cy - 250.0, cx + 250.0, cy + 250.0);
-        for idx in cands {
-            let pin = &pd.pins[idx];
-            if !challenge_labels.contains(&pin.label_id) { continue; }
-            if !Self::pin_on_active_floor(pd, floor_idx, pin.id) { continue; }
-            if done_set.map(|s| s.contains(&pin.id)).unwrap_or(false) { continue; }
-            let d_event = ((pin.x - cx).powi(2) + (pin.y - cy).powi(2)).sqrt();
-            if d_event > 250.0 { continue; }
-            let dwell = pos_history.iter().filter(|(hx, hz, t)| {
-                let age = t.elapsed().as_secs_f32();
-                if !(8.0..300.0).contains(&age) { return false; }
-                let (px, py) = xf.apply(md.origin, *hx, *hz);
-                let d = ((pin.x - px).powi(2) + (pin.y - py).powi(2)).sqrt();
-                d <= 40.0
-            }).count();
-            if dwell >= 3 {
-                completed.entry((bucket, md.map_id)).or_default().insert(pin.id);
-                // Flash ring feedback at the marked challenge pin.
-                recent.push((pin.x, pin.y, std::time::Instant::now()));
-                let name = pd.labels.iter().find(|l| l.id == pin.label_id)
-                    .map(|l| l.name.clone()).unwrap_or_else(|| "Challenge".into());
-                tracing::info!("challenge completed: {name} (dwell {dwell}, event {d_event:.0}px)");
-                return Some(format!("🏁 {name} completed"));
-            }
-        }
-
-        // ── Rule 2: regular chest pin ──
+        // Regular chest pin match.
         let chest_labels = pd.semantic_labels(PinCategory::Chests);
         let name = Self::match_pin(
             md, pd, completed, bucket, xf,

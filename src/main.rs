@@ -288,6 +288,10 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
         // entity ids change on scene loads, so a silent id means the
         // avatar got a new one and we must re-learn.
         let mut last_player_batch_at: Option<std::time::Instant> = None;
+        // The learned id's most recent batch position — compared against
+        // fresh direct-carrier fixes (ground truth): a big divergence
+        // means the learned id is following an NPC, not the player.
+        let mut player_batch_pos: Option<(f32, f32, f32)> = None;
         // Avatar-scene UID votes → identifies the in-game account (7.x
         // removed user_id from wire headers).
         let mut uid_votes: HashMap<u32, u32> = HashMap::new();
@@ -1032,6 +1036,27 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                 let (px, py, pz) = pos_tracker.last.unwrap();
                                 last_position_at = Some(std::time::Instant::now());
                                 last_direct_at = Some(std::time::Instant::now());
+                                // Divergence eviction: the direct carrier
+                                // is ground truth — if the learned batch
+                                // entity's position disagrees by a lot,
+                                // we latched onto an NPC (mis-learning
+                                // under id churn, e.g. transformations).
+                                // Drop it; re-learning follows.
+                                if let Some((bx, _by, bz)) = player_batch_pos {
+                                    let div = ((bx - px).powi(2)
+                                        + (bz - pz).powi(2))
+                                    .sqrt();
+                                    if div > 150.0 {
+                                        tracing::info!(
+                                            div,
+                                            "learned entity diverged from \
+                                             direct fix — dropping \
+                                             (NPC latch)"
+                                        );
+                                        player_entity_id = None;
+                                        player_batch_pos = None;
+                                    }
+                                }
                                 if first_position_at.is_none() {
                                     first_position_at =
                                         Some(std::time::Instant::now());
@@ -1176,8 +1201,13 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                         .elapsed()
                                         .as_secs_f32();
                                     if age < 12.0 {
+                                        // Real movement is ~7.5-10
+                                        // units/s (run/sprint) — 20 +
+                                        // 9/s covers it with margin; the
+                                        // old 30 + 12/s accepted NPCs
+                                        // 50-70 units off the reference.
                                         let allowed =
-                                            30.0 + age * 12.0;
+                                            20.0 + age * 9.0;
                                         let best = entries
                                             .iter()
                                             .map(|(id, m)| {
@@ -1237,6 +1267,11 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                     }
                                     last_player_batch_at =
                                         Some(std::time::Instant::now());
+                                    player_batch_pos = Some((
+                                        motion.x,
+                                        motion.y,
+                                        motion.z,
+                                    ));
                                 }
                             }
                         }
