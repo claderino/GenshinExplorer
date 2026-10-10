@@ -1095,6 +1095,7 @@ impl MapWindow {
                                 if let Some(name) = Self::match_pin(
                                     &md, pd, &mut self.completed, bucket, xf,
                                     *x, *z, 80.0, &ch_ids, None,
+                                    self.active_floor,
                                 ) {
                                     tracing::info!("challenge completed: {name}");
                                     let (mx, my) = xf.apply(md.origin, *x, *z);
@@ -1150,6 +1151,7 @@ impl MapWindow {
                                     Self::match_chest_or_challenge(
                                         &md, pd, &mut self.completed, bucket, xf,
                                         ev, &self.pos_history,
+                                        self.active_floor,
                                     )
                                 };
                                 if let Some(note) = note {
@@ -1179,6 +1181,7 @@ impl MapWindow {
                                 if let Some(name) = Self::match_pin(
                                     &md, pd, &mut self.completed, bucket, xf,
                                     *x, *z, 45.0, &oc_ids, None,
+                                    self.active_floor,
                                 ) {
                                     tracing::info!("auto-collected: {name}");
                                     self.auto_notes.push((
@@ -2847,12 +2850,35 @@ impl MapWindow {
     ///  2. Otherwise: nearest un-collected chest pin within 60px (type-word
     ///     preference).
     /// Returns the toast text.
+    /// Floor partitioning for auto-collect: on a floor, only that
+    /// floor's pins are candidates; on the surface, only pins that
+    /// belong to no floor. Stacked floors share canvas coordinates, so
+    /// a pure 2D nearest-match can mark a pin on a completely
+    /// different layer.
+    fn pin_on_active_floor(
+        pd: &PinData,
+        floor_idx: Option<usize>,
+        pin_id: u64,
+    ) -> bool {
+        match floor_idx {
+            Some(i) => pd
+                .floors
+                .get(i)
+                .map(|f| f.point_ids.contains(&pin_id))
+                .unwrap_or(false),
+            None => {
+                !pd.floors.iter().any(|f| f.point_ids.contains(&pin_id))
+            }
+        }
+    }
+
     fn match_chest_or_challenge(
         md: &MapData, pd: &PinData,
         completed: &mut HashMap<(u32, u32), std::collections::HashSet<u64>>,
         bucket: u32, xf: Xform,
         ev: &ChestMark,
         pos_history: &[(f32, f32, std::time::Instant)],
+        floor_idx: Option<usize>,
     ) -> Option<String> {
         let (cx, cy) = xf.apply(md.origin, ev.x, ev.z);
         let done_set = completed.get(&(bucket, md.map_id));
@@ -2864,6 +2890,7 @@ impl MapWindow {
         for idx in cands {
             let pin = &pd.pins[idx];
             if !challenge_labels.contains(&pin.label_id) { continue; }
+            if !Self::pin_on_active_floor(pd, floor_idx, pin.id) { continue; }
             if done_set.map(|s| s.contains(&pin.id)).unwrap_or(false) { continue; }
             let d_event = ((pin.x - cx).powi(2) + (pin.y - cy).powi(2)).sqrt();
             if d_event > 250.0 { continue; }
@@ -2888,6 +2915,7 @@ impl MapWindow {
         let name = Self::match_pin(
             md, pd, completed, bucket, xf,
             ev.x, ev.z, 60.0, &chest_labels, Some(ev.kind.as_str()),
+            floor_idx,
         )?;
         tracing::info!("auto-collected: {name}");
         Some(format!("✓ {name} auto-collected"))
@@ -2904,6 +2932,7 @@ impl MapWindow {
         x: f32, z: f32, radius: f64,
         label_ids: &std::collections::HashSet<u32>,
         hint: Option<&str>,
+        floor_idx: Option<usize>,
     ) -> Option<String> {
         let r = radius;
         let (cx, cy) = xf.apply(md.origin, x, z);
@@ -2915,6 +2944,9 @@ impl MapWindow {
         for idx in cands {
             let pin = &pd.pins[idx];
             if !label_ids.contains(&pin.label_id) { continue; }
+            // Layer partitioning — never mark a pin that belongs to a
+            // different floor than the player is on.
+            if !Self::pin_on_active_floor(pd, floor_idx, pin.id) { continue; }
             if done_set.map(|s| s.contains(&pin.id)).unwrap_or(false) { continue; }
             let d = ((pin.x - cx).powi(2) + (pin.y - cy).powi(2)).sqrt();
             if d > r { continue; }

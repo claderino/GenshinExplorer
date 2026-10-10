@@ -258,6 +258,14 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
         // Player's entity_id for batch filtering (learned from the direct
         // carrier's position matching a batch entry).
         let mut player_entity_id: Option<u64> = None;
+        // When the direct carrier (ground truth, ~6 s cadence) last
+        // fired — gates batch entity learning: the reference position
+        // must be fresh enough that the player can't have moved far.
+        let mut last_direct_at: Option<std::time::Instant> = None;
+        // When the learned entity id last matched a batch entry —
+        // entity ids change on scene loads, so a silent id means the
+        // avatar got a new one and we must re-learn.
+        let mut last_player_batch_at: Option<std::time::Instant> = None;
         // Avatar-scene UID votes → identifies the in-game account (7.x
         // removed user_id from wire headers).
         let mut uid_votes: HashMap<u32, u32> = HashMap::new();
@@ -996,6 +1004,7 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                             if pos_tracker.accept(motion.x, motion.y, motion.z) {
                                 let (px, py, pz) = pos_tracker.last.unwrap();
                                 last_position_at = Some(std::time::Instant::now());
+                                last_direct_at = Some(std::time::Instant::now());
                                 if first_position_at.is_none() {
                                     first_position_at =
                                         Some(std::time::Instant::now());
@@ -1091,35 +1100,117 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                             }
                         }
 
-                        // Batch entries: learn player entity_id, then use
-                        // their entries for faster (~1 Hz) updates.
-                        for (entity_id, motion) in explore::detect_batch_entries(command) {
+                        // Batch entries: learn the player's entity_id,
+                        // then use their entries for faster (~1 Hz)
+                        // updates. Learning picks the NEAREST candidate
+                        // to a FRESH direct-carrier fix, with a radius
+                        // scaled by the fix's age (a moving player is
+                        // tens of units from a 6 s-old fix — the old
+                        // fixed 30-unit rule never learned while
+                        // moving). A learned id that stops matching
+                        // batch entries for 20 s (scene loads assign
+                        // new entity ids) triggers re-learning.
+                        let entries = explore::detect_batch_entries(command);
+                        if !entries.is_empty() {
                             match player_entity_id {
-                                None => {
-                                    // Learning phase: find the entity whose
-                                    // position is closest to the last direct
-                                    // carrier position.
-                                    if let Some((lx, _ly, lz)) = pos_tracker.last {
-                                        let dist = ((motion.x - lx).powi(2)
-                                            + (motion.z - lz).powi(2))
-                                        .sqrt();
-                                        if dist < 30.0 {
-                                            player_entity_id = Some(entity_id);
-                                            tracing::info!(
-                                                entity_id,
-                                                "learned player entity_id from batch"
-                                            );
-                                        }
-                                    }
-                                }
-                                Some(pid) if entity_id == pid => {
-                                    // Player's batch entry — faster update.
-                                    if pos_tracker.accept(motion.x, motion.y, motion.z) {
-                                        let (px, py, pz) = pos_tracker.last.unwrap();
-                                        let _ = tx.send(Msg::Position { x: px, y: py, z: pz });
+                                Some(pid)
+                                    if !entries
+                                        .iter()
+                                        .any(|(id, _)| *id == pid) =>
+                                {
+                                    // This snapshot has no entry for the
+                                    // learned id.
+                                    let stale = last_player_batch_at
+                                        .map(|t| {
+                                            t.elapsed()
+                                                >= Duration::from_secs(20)
+                                        })
+                                        .unwrap_or(true);
+                                    if stale {
+                                        tracing::info!(
+                                            "player entity id stale — \
+                                             re-learning"
+                                        );
+                                        player_entity_id = None;
                                     }
                                 }
                                 _ => {}
+                            }
+                            if player_entity_id.is_none() {
+                                // Learning: nearest entry to a fresh
+                                // direct fix, within an age-scaled
+                                // radius.
+                                if let (
+                                    Some((lx, _ly, lz)),
+                                    Some(direct_at),
+                                ) = (pos_tracker.last, last_direct_at)
+                                {
+                                    let age = direct_at
+                                        .elapsed()
+                                        .as_secs_f32();
+                                    if age < 12.0 {
+                                        let allowed =
+                                            30.0 + age * 12.0;
+                                        let best = entries
+                                            .iter()
+                                            .map(|(id, m)| {
+                                                (
+                                                    ((m.x - lx).powi(2)
+                                                        + (m.z - lz)
+                                                            .powi(2))
+                                                    .sqrt(),
+                                                    *id,
+                                                )
+                                            })
+                                            .min_by(|a, b| {
+                                                a.0.partial_cmp(&b.0)
+                                                    .unwrap_or(
+                                                        std::cmp::Ordering::Equal,
+                                                    )
+                                            });
+                                        if let Some((d, id)) = best {
+                                            if d < allowed {
+                                                player_entity_id =
+                                                    Some(id);
+                                                last_player_batch_at =
+                                                    Some(
+                                                        std::time::Instant::now(
+                                                        ),
+                                                    );
+                                                tracing::info!(
+                                                    entity_id = id,
+                                                    dist = d,
+                                                    age_s = age,
+                                                    "learned player \
+                                                     entity_id from \
+                                                     batch"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(pid) = player_entity_id {
+                            for (entity_id, motion) in &entries {
+                                if *entity_id == pid {
+                                    // Player's batch entry — fast update.
+                                    if pos_tracker.accept(
+                                        motion.x,
+                                        motion.y,
+                                        motion.z,
+                                    ) {
+                                        let (px, py, pz) =
+                                            pos_tracker.last.unwrap();
+                                        let _ = tx.send(Msg::Position {
+                                            x: px,
+                                            y: py,
+                                            z: pz,
+                                        });
+                                    }
+                                    last_player_batch_at =
+                                        Some(std::time::Instant::now());
+                                }
                             }
                         }
                         for entity in explore::detect_entities(command) {
