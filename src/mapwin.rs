@@ -320,9 +320,12 @@ pub struct MapWindow {
     recent_interact_worlds: Vec<(f32, f32, std::time::Instant)>,
     /// How long the collect flash ring stays visible (seconds).
     collect_flash_secs: f32,
-    /// Interact events (881 Rsp) awaiting pin matching —
+    /// Gadget interact events (881 Rsp) awaiting pin matching —
     /// (x, z, interact_type, gadget_id).
     pending_interacts: Vec<(f32, f32, u64, u64)>,
+    /// Gadget state changes (22292) awaiting seelie-court candidate
+    /// evaluation — (x, z, gadget_id, state).
+    pending_gadget_states: Vec<(f32, f32, u64, u32)>,
     /// The login pin-match has served its purpose (or a layer packet
     /// arrived) — waypoint pin-matching is retired for this map session.
     pin_match_retired: bool,
@@ -465,6 +468,7 @@ impl MapWindow {
             region_lock: None,
             pending_layer: None,
             pending_interacts: Vec::new(),
+            pending_gadget_states: Vec::new(),
             recent_collected: Vec::new(),
             recent_interact_worlds: Vec::new(),
             collect_flash_secs: Self::load_settings().collect_flash_secs,
@@ -498,6 +502,19 @@ impl MapWindow {
     /// config id appeared in a small command).
     /// Queue a server-confirmed gadget interaction for exact-position
     /// pin matching.
+    pub fn note_gadget_state(
+        &mut self,
+        x: f32,
+        z: f32,
+        gadget_id: u64,
+        state: u32,
+    ) {
+        if self.pending_gadget_states.len() >= 100 {
+            self.pending_gadget_states.remove(0);
+        }
+        self.pending_gadget_states.push((x, z, gadget_id, state));
+    }
+
     pub fn note_gadget_interact(
         &mut self,
         x: f32,
@@ -1186,6 +1203,82 @@ impl MapWindow {
                                 t.elapsed().as_secs_f32() < 600.0
                             });
                             Self::write_completed(&self.completed);
+                        }
+                    }
+
+                    // Gadget state changes → seelie-court candidate
+                    // logging (LEARN MODE): when a state change happens
+                    // near an UNCOLLECTED seelie pin, log the gadget id
+                    // + state loudly. Once a court id + done-state is
+                    // confirmed from a real seelie completion, promote
+                    // it to auto-marking here.
+                    if !self.pending_gadget_states.is_empty() {
+                        if let Some(pd) = pin_data.as_ref() {
+                            let bucket = self.active_uid.unwrap_or(0);
+                            let xf = {
+                                let (sx, sy) = self.cal_scale
+                                    .unwrap_or((md.world_scale, md.world_scale));
+                                let (ox, oy) =
+                                    self.calibrate_offset.unwrap_or((0.0, 0.0));
+                                Xform { sx, sy, ox, oy }
+                            };
+                            let seelie_labels: std::collections::HashSet<u32> =
+                                pd.labels
+                                    .iter()
+                                    .filter(|l| {
+                                        l.name.to_lowercase().contains("seelie")
+                                    })
+                                    .map(|l| l.id)
+                                    .collect();
+                            let done_set =
+                                self.completed.get(&(bucket, md.map_id));
+                            let events = std::mem::take(
+                                &mut self.pending_gadget_states,
+                            );
+                            if !seelie_labels.is_empty() {
+                                for (x, z, gid, st) in &events {
+                                    let (cx, cy) =
+                                        xf.apply(md.origin, *x, *z);
+                                    let near = pd.index.query(
+                                        cx - 60.0,
+                                        cy - 60.0,
+                                        cx + 60.0,
+                                        cy + 60.0,
+                                    );
+                                    for idx in near {
+                                        let pin = &pd.pins[idx];
+                                        if !seelie_labels
+                                            .contains(&pin.label_id)
+                                        {
+                                            continue;
+                                        }
+                                        if !Self::pin_on_active_floor(
+                                            pd,
+                                            self.active_floor,
+                                            pin.id,
+                                        ) {
+                                            continue;
+                                        }
+                                        let d = ((pin.x - cx)
+                                            .powi(2)
+                                            + (pin.y - cy).powi(2))
+                                        .sqrt();
+                                        if d > 60.0 {
+                                            continue;
+                                        }
+                                        let already = done_set
+                                            .map(|s| s.contains(&pin.id))
+                                            .unwrap_or(false);
+                                        tracing::info!(
+                                            "SEELIE CANDIDATE: pin {} \
+                                             gid={gid} state={st} \
+                                             d={d:.0}px \
+                                             collected={already}",
+                                            pin.id
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
 

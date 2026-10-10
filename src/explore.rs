@@ -531,6 +531,26 @@ pub fn detect_gadget_spawns(cmd: &GameCommand) -> Vec<GadgetSpawn> {
     out
 }
 
+/// GadgetStateNotify (22292): `{3: gadget_entity_id, 7: gadget_state}` —
+/// fires on gadget state transitions (seelie courts "arriving", puzzle
+/// completions, chest locks).
+pub fn detect_gadget_state(cmd: &GameCommand) -> Option<(u64, u32)> {
+    if cmd.command_id != 22292 {
+        return None;
+    }
+    let fields = parse(&cmd.proto_data)?;
+    let mut entity_id = None;
+    let mut state = None;
+    for (f, v) in &fields {
+        match *f {
+            3 => entity_id = v.as_varint(),
+            7 => state = v.as_varint().map(|s| s as u32),
+            _ => {}
+        }
+    }
+    Some((entity_id?, state?))
+}
+
 /// GadgetInteractRsp (881): server-confirmed interaction with a gadget —
 /// `{3: gadget_id, 11: interact_type, 15: gadget_entity_id}`.
 /// InteractType 3 = OPEN_CHEST, 8 = GENERAL_REWARD (chest family).

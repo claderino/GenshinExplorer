@@ -72,6 +72,14 @@ pub enum Msg {
         interact_type: u64,
         gadget_id: u64,
     },
+    /// Gadget state change (22292) at a registry position —
+    /// seelie-court candidate logging.
+    GadgetState {
+        x: f32,
+        z: f32,
+        gadget_id: u64,
+        state: u32,
+    },
 }
 
 /// Release builds run with the windows GUI subsystem (no console), so
@@ -251,10 +259,11 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
 
         // Gadget entity registry (for interact matching).
         let mut gadget_entities: HashMap<u64, ()> = HashMap::new();
-        // Gadget entity registry (entity_id → world position), built
-        // from SceneEntityAppearNotify (27685) — resolves
-        // GadgetInteractRsp entity ids to exact gadget positions.
-        let mut gadget_registry: HashMap<u64, (f32, f32, f32)> =
+        // Gadget entity registry (entity_id → gadget_id + world
+        // position), built from SceneEntityAppearNotify (27685) —
+        // resolves GadgetInteractRsp entity ids to exact gadget
+        // positions.
+        let mut gadget_registry: HashMap<u64, (u64, f32, f32, f32)> =
             HashMap::new();
         // Command census + small-command capture (pattern learning).
         let mut census: HashMap<u16, (u64, Option<String>)> = HashMap::new();
@@ -1236,7 +1245,12 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                         for spawn in explore::detect_gadget_spawns(command) {
                             gadget_registry.insert(
                                 spawn.entity_id,
-                                (spawn.x, spawn.y, spawn.z),
+                                (
+                                    spawn.gadget_id,
+                                    spawn.x,
+                                    spawn.y,
+                                    spawn.z,
+                                ),
                             );
                         }
                         // Cap the registry (long sessions accumulate; a
@@ -1250,7 +1264,7 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                         if let Some(inter) =
                             explore::detect_gadget_interact(command)
                         {
-                            if let Some(&(x, _y, z)) =
+                            if let Some(&(_, x, _y, z)) =
                                 gadget_registry.get(&inter.entity_id)
                             {
                                 tracing::debug!(
@@ -1270,6 +1284,29 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                     "gadget interact — entity not in \
                                      registry (spawned before capture?)"
                                 );
+                            }
+                        }
+
+                        // Gadget state changes (22292) → seelie-court
+                        // candidate logging (learn mode: the court gadget
+                        // id + done-state get promoted to auto-marking
+                        // once observed).
+                        if let Some((entity_id, state)) =
+                            explore::detect_gadget_state(command)
+                        {
+                            if let Some(&(_, x, _y, z)) =
+                                gadget_registry.get(&entity_id)
+                            {
+                                let gid = gadget_registry
+                                    .get(&entity_id)
+                                    .map(|(g, ..)| *g)
+                                    .unwrap_or(0);
+                                let _ = tx.send(Msg::GadgetState {
+                                    x,
+                                    z,
+                                    gadget_id: gid,
+                                    state,
+                                });
                             }
                         }
 
@@ -1509,6 +1546,14 @@ impl eframe::App for ExplorerApp {
                         z,
                         interact_type,
                         gadget_id,
+                    );
+                }
+                Msg::GadgetState { x, z, gadget_id, state } => {
+                    self.map_window.note_gadget_state(
+                        x,
+                        z,
+                        gadget_id,
+                        state,
                     );
                 }
             }
