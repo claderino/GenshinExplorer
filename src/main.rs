@@ -296,6 +296,8 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
         // suppression for the auto-collect path.
         let mut last_interact_entity: Option<(u64, std::time::Instant)> =
             None;
+        // Last seen avatar_id (character-switch logging).
+        let mut last_avatar_id: Option<u32> = None;
         // Avatar-scene UID votes → identifies the in-game account (7.x
         // removed user_id from wire headers).
         let mut uid_votes: HashMap<u32, u32> = HashMap::new();
@@ -1291,6 +1293,39 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                     spawn.z,
                                 ),
                             );
+                        }
+                        // Avatar entities → DETERMINISTIC player
+                        // resolution: the avatar whose SceneAvatarInfo
+                        // uid matches the detected game UID is the
+                        // player, by definition. Supersedes any
+                        // mis-learned batch entity (NPC latches
+                        // self-heal the moment an avatar appears).
+                        for av in explore::detect_avatar_entities(command) {
+                            if Some(av.uid as u64)
+                                == detected_uid.map(|u| u as u64)
+                            {
+                                if player_entity_id != Some(av.entity_id) {
+                                    tracing::info!(
+                                        entity_id = av.entity_id,
+                                        avatar_id = av.avatar_id,
+                                        "player entity resolved from \
+                                         avatar uid"
+                                    );
+                                    player_entity_id = Some(av.entity_id);
+                                    player_batch_pos = None;
+                                    last_player_batch_at =
+                                        Some(std::time::Instant::now());
+                                }
+                                if last_avatar_id != Some(av.avatar_id) {
+                                    if last_avatar_id.is_some() {
+                                        tracing::info!(
+                                            avatar_id = av.avatar_id,
+                                            "switched character"
+                                        );
+                                    }
+                                    last_avatar_id = Some(av.avatar_id);
+                                }
+                            }
                         }
                         // Cap the registry (long sessions accumulate; a
                         // clear on overflow is harmless — the registry

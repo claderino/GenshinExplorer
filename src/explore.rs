@@ -452,6 +452,72 @@ pub fn chest_tier_from_gadget_id(gadget_id: u64) -> Option<&'static str> {
     })
 }
 
+/// An avatar entity from SceneEntityAppearNotify (27685) —
+/// `{2: entity_id, 10: SceneAvatarInfo{1: uid, 2: avatar_id}}` with
+/// entity_type == 1. The entity whose uid matches the detected game
+/// UID IS the player — deterministic entity resolution, no
+/// positional learning (and no NPC latching possible).
+#[derive(Debug, Clone)]
+pub struct AvatarEntity {
+    pub entity_id: u64,
+    pub uid: u32,
+    pub avatar_id: u32,
+}
+
+pub fn detect_avatar_entities(cmd: &GameCommand) -> Vec<AvatarEntity> {
+    if cmd.command_id != 27685 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let Some(fields) = parse(&cmd.proto_data) else {
+        return out;
+    };
+    for (f, v) in &fields {
+        if *f != 8 {
+            continue;
+        }
+        let Some(bytes) = v.as_bytes() else { continue };
+        let Some(entity) = parse(bytes) else { continue };
+        let mut entity_type = None;
+        let mut entity_id = None;
+        let mut uid = None;
+        let mut avatar_id = None;
+        for (ef, ev) in &entity {
+            match *ef {
+                1 => entity_type = ev.as_varint(),
+                2 => entity_id = ev.as_varint(),
+                // oneof avatar = SceneAvatarInfo
+                10 => {
+                    if let Some(av) = ev.as_bytes() {
+                        if let Some(af) = parse(av) {
+                            for (afn, avv) in &af {
+                                match *afn {
+                                    1 => uid = avv.as_varint(),
+                                    2 => avatar_id = avv.as_varint(),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // ProtEntityType 1 = avatar.
+        if entity_type == Some(1) {
+            if let (Some(id), Some(u), Some(a)) = (entity_id, uid, avatar_id)
+            {
+                out.push(AvatarEntity {
+                    entity_id: id,
+                    uid: u as u32,
+                    avatar_id: a as u32,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Gadget spawns from SceneEntityAppearNotify (27685):
 /// `{8: [SceneEntityInfo]}` where gadget entities are
 /// `{1: type=4, 2: entity_id, 4: motion{1: pos{1,2,3}},
