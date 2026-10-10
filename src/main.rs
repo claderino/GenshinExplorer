@@ -66,7 +66,12 @@ pub enum Msg {
     MapLayer { layer_id: Option<u64> },
     /// Server-confirmed gadget interaction at an exact registry
     /// position (881 GadgetInteractRsp + entity appear registry).
-    GadgetInteract { x: f32, z: f32, interact_type: u64 },
+    GadgetInteract {
+        x: f32,
+        z: f32,
+        interact_type: u64,
+        gadget_id: u64,
+    },
 }
 
 /// Release builds run with the windows GUI subsystem (no console), so
@@ -1257,6 +1262,7 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                     x,
                                     z,
                                     interact_type: inter.interact_type,
+                                    gadget_id: inter.gadget_id,
                                 });
                             } else {
                                 tracing::debug!(
@@ -1497,9 +1503,13 @@ impl eframe::App for ExplorerApp {
                 Msg::MapLayer { layer_id } => {
                     self.map_window.note_map_layer(layer_id);
                 }
-                Msg::GadgetInteract { x, z, interact_type } => {
-                    self.map_window
-                        .note_gadget_interact(x, z, interact_type);
+                Msg::GadgetInteract { x, z, interact_type, gadget_id } => {
+                    self.map_window.note_gadget_interact(
+                        x,
+                        z,
+                        interact_type,
+                        gadget_id,
+                    );
                 }
             }
         }

@@ -320,9 +320,9 @@ pub struct MapWindow {
     recent_interact_worlds: Vec<(f32, f32, std::time::Instant)>,
     /// How long the collect flash ring stays visible (seconds).
     collect_flash_secs: f32,
-    /// Gadget interact events (881 Rsp) awaiting pin matching —
-    /// (x, z, interact_type).
-    pending_interacts: Vec<(f32, f32, u64)>,
+    /// Interact events (881 Rsp) awaiting pin matching —
+    /// (x, z, interact_type, gadget_id).
+    pending_interacts: Vec<(f32, f32, u64, u64)>,
     /// The login pin-match has served its purpose (or a layer packet
     /// arrived) — waypoint pin-matching is retired for this map session.
     pin_match_retired: bool,
@@ -498,7 +498,13 @@ impl MapWindow {
     /// config id appeared in a small command).
     /// Queue a server-confirmed gadget interaction for exact-position
     /// pin matching.
-    pub fn note_gadget_interact(&mut self, x: f32, z: f32, ty: u64) {
+    pub fn note_gadget_interact(
+        &mut self,
+        x: f32,
+        z: f32,
+        ty: u64,
+        gadget_id: u64,
+    ) {
         // Sighting recorded at MESSAGE-ARRIVAL time (before the frame
         // processes either queue): KCP is an ordered stream, so a chest's
         // GadgetInteractRsp always precedes its ItemAdd — recording here
@@ -511,7 +517,7 @@ impl MapWindow {
         if self.pending_interacts.len() >= 50 {
             self.pending_interacts.remove(0);
         }
-        self.pending_interacts.push((x, z, ty));
+        self.pending_interacts.push((x, z, ty, gadget_id));
     }
 
     pub fn note_oculus(&mut self, x: f32, z: f32) {
@@ -1280,13 +1286,19 @@ impl MapWindow {
                                 pd.semantic_labels(PinCategory::Chests);
                             let events =
                                 std::mem::take(&mut self.pending_interacts);
-                            for (x, z, ty) in &events {
+                            for (x, z, ty, gid) in &events {
                                 if !matches!(ty, 3 | 8) {
                                     continue; // chest family only
                                 }
+                                // Exact chest tier from the gadget
+                                // config id — much stronger than the
+                                // Mora heuristic.
+                                let hint = crate::explore::chest_tier_from_gadget_id(
+                                    *gid,
+                                );
                                 if let Some(name) = Self::match_pin(
                                     &md, pd, &mut self.completed, bucket,
-                                    xf, *x, *z, 30.0, &chest_labels, None,
+                                    xf, *x, *z, 30.0, &chest_labels, hint,
                                     self.active_floor,
                                     &mut self.recent_collected,
                                 ) {
