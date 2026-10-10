@@ -64,6 +64,9 @@ pub enum Msg {
     /// Minimap layer entry (5991 _EnterMapLayerReq) — the definitive
     /// floor signal. `None` = default (base) layer.
     MapLayer { layer_id: Option<u64> },
+    /// Server-confirmed gadget interaction at an exact registry
+    /// position (881 GadgetInteractRsp + entity appear registry).
+    GadgetInteract { x: f32, z: f32, interact_type: u64 },
 }
 
 /// Release builds run with the windows GUI subsystem (no console), so
@@ -243,6 +246,11 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
 
         // Gadget entity registry (for interact matching).
         let mut gadget_entities: HashMap<u64, ()> = HashMap::new();
+        // Gadget entity registry (entity_id → world position), built
+        // from SceneEntityAppearNotify (27685) — resolves
+        // GadgetInteractRsp entity ids to exact gadget positions.
+        let mut gadget_registry: HashMap<u64, (f32, f32, f32)> =
+            HashMap::new();
         // Command census + small-command capture (pattern learning).
         let mut census: HashMap<u16, (u64, Option<String>)> = HashMap::new();
         let mut last_census = std::time::Instant::now();
@@ -562,6 +570,11 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                     "scene enter"
                                 );
                                 current_scene = Some(scene);
+                                // All entities from the old scene are
+                                // gone — the gadget registry must not
+                                // resolve interact ids to stale
+                                // positions.
+                                gadget_registry.clear();
                                 let mapped = match scene {
                                     429_4906_403 => Some(2u32),  // Teyvat
                                     429_4906_400 => Some(9u32),  // Chasm mines
@@ -1213,6 +1226,47 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                 }
                             }
                         }
+                        // Gadget spawns → registry for interact
+                        // position resolution.
+                        for spawn in explore::detect_gadget_spawns(command) {
+                            gadget_registry.insert(
+                                spawn.entity_id,
+                                (spawn.x, spawn.y, spawn.z),
+                            );
+                        }
+                        // Cap the registry (long sessions accumulate; a
+                        // clear on overflow is harmless — the registry
+                        // rebuilds from the next appear notify).
+                        if gadget_registry.len() > 65_536 {
+                            gadget_registry.clear();
+                        }
+                        // Server-confirmed gadget interaction → exact
+                        // position from the registry.
+                        if let Some(inter) =
+                            explore::detect_gadget_interact(command)
+                        {
+                            if let Some(&(x, _y, z)) =
+                                gadget_registry.get(&inter.entity_id)
+                            {
+                                tracing::debug!(
+                                    entity = inter.entity_id,
+                                    ty = inter.interact_type,
+                                    "gadget interact resolved"
+                                );
+                                let _ = tx.send(Msg::GadgetInteract {
+                                    x,
+                                    z,
+                                    interact_type: inter.interact_type,
+                                });
+                            } else {
+                                tracing::debug!(
+                                    entity = inter.entity_id,
+                                    "gadget interact — entity not in \
+                                     registry (spawned before capture?)"
+                                );
+                            }
+                        }
+
                         for entity in explore::detect_entities(command) {
                             for &(_, id) in &entity.varints {
                                 if id > 10_000_000 {
@@ -1442,6 +1496,10 @@ impl eframe::App for ExplorerApp {
                 }
                 Msg::MapLayer { layer_id } => {
                     self.map_window.note_map_layer(layer_id);
+                }
+                Msg::GadgetInteract { x, z, interact_type } => {
+                    self.map_window
+                        .note_gadget_interact(x, z, interact_type);
                 }
             }
         }

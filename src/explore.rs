@@ -409,6 +409,129 @@ pub fn detect_challenge_result(cmd: &GameCommand) -> Option<ChallengeResult> {
     }
 }
 
+/// A gadget entity spawn from SceneEntityAppearNotify (27685).
+#[derive(Debug, Clone)]
+pub struct GadgetSpawn {
+    pub entity_id: u64,
+    pub gadget_id: u64,
+    pub config_id: u64,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+/// Gadget spawns from SceneEntityAppearNotify (27685):
+/// `{8: [SceneEntityInfo]}` where gadget entities are
+/// `{1: type=4, 2: entity_id, 4: motion{1: pos{1,2,3}},
+///   13: gadget{1: gadget_id, 3: config_id}}`.
+/// Builds the registry that turns GadgetInteractRsp entity ids into
+/// exact world positions.
+pub fn detect_gadget_spawns(cmd: &GameCommand) -> Vec<GadgetSpawn> {
+    if cmd.command_id != 27685 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let Some(fields) = parse_partial(&cmd.proto_data)
+        .map(|(f, _)| f)
+        .or_else(|| parse(&cmd.proto_data))
+    else {
+        return out;
+    };
+    for (f, v) in &fields {
+        if *f != 8 {
+            continue;
+        }
+        let Some(bytes) = v.as_bytes() else { continue };
+        let Some(entity) = parse(bytes) else { continue };
+        let mut entity_type = None;
+        let mut entity_id = None;
+        let mut pos = None;
+        let mut gadget_id = None;
+        let mut config_id = None;
+        for (ef, ev) in &entity {
+            match *ef {
+                1 => entity_type = ev.as_varint(),
+                2 => entity_id = ev.as_varint(),
+                4 => {
+                    if let Some(motion) = ev.as_bytes() {
+                        if let Some(mf) = parse(motion) {
+                            for (mfn, mv) in &mf {
+                                if *mfn == 1 {
+                                    if let Some(pos_bytes) = mv.as_bytes()
+                                    {
+                                        pos = parse_vector(pos_bytes);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                13 => {
+                    if let Some(gadget) = ev.as_bytes() {
+                        if let Some(gf) = parse(gadget) {
+                            for (gfn, gv) in &gf {
+                                match *gfn {
+                                    1 => gadget_id = gv.as_varint(),
+                                    3 => config_id = gv.as_varint(),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // ProtEntityType 4 = gadget.
+        if entity_type == Some(4) {
+            if let (Some(id), Some((x, y, z))) = (entity_id, pos) {
+                out.push(GadgetSpawn {
+                    entity_id: id,
+                    gadget_id: gadget_id.unwrap_or(0),
+                    config_id: config_id.unwrap_or(0),
+                    x,
+                    y,
+                    z,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// GadgetInteractRsp (881): server-confirmed interaction with a gadget —
+/// `{3: gadget_id, 11: interact_type, 15: gadget_entity_id}`.
+/// InteractType 3 = OPEN_CHEST, 8 = GENERAL_REWARD (chest family).
+#[derive(Debug, Clone)]
+pub struct GadgetInteract {
+    pub entity_id: u64,
+    pub gadget_id: u64,
+    pub interact_type: u64,
+}
+
+pub fn detect_gadget_interact(cmd: &GameCommand) -> Option<GadgetInteract> {
+    if cmd.command_id != 881 {
+        return None;
+    }
+    let fields = parse(&cmd.proto_data)?;
+    let mut entity_id = None;
+    let mut gadget_id = None;
+    let mut interact_type = None;
+    for (f, v) in &fields {
+        match *f {
+            15 => entity_id = v.as_varint(),
+            3 => gadget_id = v.as_varint(),
+            11 => interact_type = v.as_varint(),
+            _ => {}
+        }
+    }
+    Some(GadgetInteract {
+        entity_id: entity_id?,
+        gadget_id: gadget_id.unwrap_or(0),
+        interact_type: interact_type.unwrap_or(0),
+    })
+}
+
 /// Scene-entry (cmd 9582 = PlayerEnterSceneNotify): `{9: scene_id,
 /// 6: prev_scene_id, …}`. Every separate region has its own scene id —
 /// this is the authoritative "which world am I in" signal:

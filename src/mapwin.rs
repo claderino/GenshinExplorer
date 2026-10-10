@@ -299,6 +299,9 @@ pub struct MapWindow {
     /// Resolved via the learned mapping, or learned from geometry when
     /// the position enters a floor overlay.
     pending_layer: Option<u64>,
+    /// Gadget interact events (881 Rsp) awaiting pin matching —
+    /// (x, z, interact_type).
+    pending_interacts: Vec<(f32, f32, u64)>,
     /// The login pin-match has served its purpose (or a layer packet
     /// arrived) — waypoint pin-matching is retired for this map session.
     pin_match_retired: bool,
@@ -440,6 +443,7 @@ impl MapWindow {
             pending_region: None,
             region_lock: None,
             pending_layer: None,
+            pending_interacts: Vec::new(),
             pin_match_retired: false,
             layer_authoritative_at: None,
             active_layer: None,
@@ -468,6 +472,15 @@ impl MapWindow {
 
     /// Queue an oculus collection (player position when the oculus gadget
     /// config id appeared in a small command).
+    /// Queue a server-confirmed gadget interaction for exact-position
+    /// pin matching.
+    pub fn note_gadget_interact(&mut self, x: f32, z: f32, ty: u64) {
+        if self.pending_interacts.len() >= 50 {
+            self.pending_interacts.remove(0);
+        }
+        self.pending_interacts.push((x, z, ty));
+    }
+
     pub fn note_oculus(&mut self, x: f32, z: f32) {
         if self.pending_oculi.len() >= 50 {
             self.pending_oculi.remove(0);
@@ -1161,6 +1174,52 @@ impl MapWindow {
                             Self::write_completed(&self.completed);
                         }
                         // Pins not loaded yet → events stay queued.
+                    }
+
+                    // Auto-collect: server-confirmed gadget interactions
+                    // (881 GadgetInteractRsp) resolved through the entity
+                    // registry to the gadget's EXACT world position —
+                    // no player-position approximation. InteractType 3
+                    // = OPEN_CHEST, 8 = GENERAL_REWARD (chest family).
+                    if !self.pending_interacts.is_empty() {
+                        if let Some(pd) = pin_data.as_ref() {
+                            let bucket = self.active_uid.unwrap_or(0);
+                            let xf = {
+                                let (sx, sy) = self.cal_scale
+                                    .unwrap_or((md.world_scale, md.world_scale));
+                                let (ox, oy) =
+                                    self.calibrate_offset.unwrap_or((0.0, 0.0));
+                                Xform { sx, sy, ox, oy }
+                            };
+                            let chest_labels =
+                                pd.semantic_labels(PinCategory::Chests);
+                            let events =
+                                std::mem::take(&mut self.pending_interacts);
+                            for (x, z, ty) in &events {
+                                if !matches!(ty, 3 | 8) {
+                                    continue; // chest family only
+                                }
+                                if let Some(name) = Self::match_pin(
+                                    &md, pd, &mut self.completed, bucket,
+                                    xf, *x, *z, 30.0, &chest_labels, None,
+                                    self.active_floor,
+                                ) {
+                                    tracing::info!(
+                                        "interact-collected: {name} \
+                                         (type {ty})"
+                                    );
+                                    self.auto_notes.push((
+                                        format!("✓ {name} collected"),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                            }
+                            if self.auto_notes.len() > 8 {
+                                let drop = self.auto_notes.len() - 8;
+                                self.auto_notes.drain(0..drop);
+                            }
+                            Self::write_completed(&self.completed);
+                        }
                     }
 
                     // Auto-collect: oculus gadget state change + player
