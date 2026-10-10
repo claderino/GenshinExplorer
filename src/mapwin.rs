@@ -195,6 +195,16 @@ fn solve_all_frames(
 /// scenes: same-scene-generation points get priority (nearest within
 /// `SAME_GEN_RADIUS`), then any frame with a point within
 /// `REJOIN_RADIUS` (returning to a known area), else None.
+/// Persisted UI settings (settings.json).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Settings {
+    #[serde(default = "default_flash_secs")]
+    collect_flash_secs: f32,
+}
+fn default_flash_secs() -> f32 {
+    8.0
+}
+
 fn assign_frame(
     frames: &[Vec<CalPoint>],
     x: f32,
@@ -299,6 +309,11 @@ pub struct MapWindow {
     /// Resolved via the learned mapping, or learned from geometry when
     /// the position enters a floor overlay.
     pending_layer: Option<u64>,
+    /// Recently auto-collected pins (canvas px + time) — drawn as a
+    /// fading red ring so the user sees WHAT got marked and where.
+    recent_collected: Vec<(f64, f64, std::time::Instant)>,
+    /// How long the collect flash ring stays visible (seconds).
+    collect_flash_secs: f32,
     /// Gadget interact events (881 Rsp) awaiting pin matching —
     /// (x, z, interact_type).
     pending_interacts: Vec<(f32, f32, u64)>,
@@ -444,6 +459,8 @@ impl MapWindow {
             region_lock: None,
             pending_layer: None,
             pending_interacts: Vec::new(),
+            recent_collected: Vec::new(),
+            collect_flash_secs: Self::load_settings().collect_flash_secs,
             pin_match_retired: false,
             layer_authoritative_at: None,
             active_layer: None,
@@ -697,6 +714,27 @@ impl MapWindow {
     fn data_dir() -> std::path::PathBuf {
         std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from)
             .unwrap_or_default().join("GenshinExplorer")
+    }
+
+    fn settings_path() -> std::path::PathBuf {
+        Self::data_dir().join("settings.json")
+    }
+    fn load_settings() -> Settings {
+        std::fs::read_to_string(Self::settings_path())
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or(Settings {
+                collect_flash_secs: 8.0,
+            })
+    }
+    fn save_settings_value(flash_secs: f32) {
+        let s = Settings {
+            collect_flash_secs: flash_secs,
+        };
+        let _ = std::fs::write(
+            Self::settings_path(),
+            serde_json::to_string(&s).unwrap_or_default(),
+        );
     }
     fn calibration_path(map_id: u32) -> Option<std::path::PathBuf> {
         std::env::var_os("LOCALAPPDATA").map(|v| std::path::PathBuf::from(v)
@@ -1109,6 +1147,7 @@ impl MapWindow {
                                     &md, pd, &mut self.completed, bucket, xf,
                                     *x, *z, 80.0, &ch_ids, None,
                                     self.active_floor,
+                                    &mut self.recent_collected,
                                 ) {
                                     tracing::info!("challenge completed: {name}");
                                     let (mx, my) = xf.apply(md.origin, *x, *z);
@@ -1165,6 +1204,7 @@ impl MapWindow {
                                         &md, pd, &mut self.completed, bucket, xf,
                                         ev, &self.pos_history,
                                         self.active_floor,
+                                        &mut self.recent_collected,
                                     )
                                 };
                                 if let Some(note) = note {
@@ -1203,6 +1243,7 @@ impl MapWindow {
                                     &md, pd, &mut self.completed, bucket,
                                     xf, *x, *z, 30.0, &chest_labels, None,
                                     self.active_floor,
+                                    &mut self.recent_collected,
                                 ) {
                                     tracing::info!(
                                         "interact-collected: {name} \
@@ -1241,6 +1282,7 @@ impl MapWindow {
                                     &md, pd, &mut self.completed, bucket, xf,
                                     *x, *z, 45.0, &oc_ids, None,
                                     self.active_floor,
+                                    &mut self.recent_collected,
                                 ) {
                                     tracing::info!("auto-collected: {name}");
                                     self.auto_notes.push((
@@ -1281,6 +1323,7 @@ impl MapWindow {
                     let mut label_search = std::mem::take(&mut self.label_search);
                     let mut floor_select: Option<Option<usize>> = None;
                     let mut floor_pick = self.active_floor;
+                    let mut flash_secs = self.collect_flash_secs;
                     // Layer-mapping manager state (locals to keep the
                     // closures free of `self` borrows).
                     let mut layers_open = self.layers_open;
@@ -1565,9 +1608,14 @@ impl MapWindow {
                                 None => { ui.spinner(); ui.label("Loading pins…"); }
                                 Some(pd) => Self::sidebar(ui, pd, &mut pin_filter,
                                     &icon_textures, &mut filter_changed, &completed,
-                                    &mut bulk_action, &mut label_search),
+                                    &mut bulk_action, &mut label_search,
+                                    &mut flash_secs),
                             }
                         });
+                    if (flash_secs - self.collect_flash_secs).abs() > f32::EPSILON {
+                        self.collect_flash_secs = flash_secs;
+                        Self::save_settings_value(flash_secs);
+                    }
                     self.sync_open = sync_open;
                     self.sync_cookie = sync_cookie;
                     self.sync_auto = sync_auto;
@@ -2637,7 +2685,13 @@ impl MapWindow {
                             pin_data.as_deref(), &pin_filter, &icon_textures,
                             &floor_stack_render,
                             &completed, &mut selected, &auto_notes,
-                            &mut quick_toggle, &mut center_request, &mut auto_map);
+                            &mut quick_toggle, &mut center_request, &mut auto_map,
+                            &self.recent_collected, self.collect_flash_secs);
+                    });
+                    // Prune expired flash entries.
+                    let flash = self.collect_flash_secs.max(0.5);
+                    self.recent_collected.retain(|(_, _, t)| {
+                        t.elapsed().as_secs_f32() < flash
                     });
                     self.center_request = center_request;
                     // Cycling 🗺 auto (off→on) releases a manual map lock.
@@ -2938,6 +2992,7 @@ impl MapWindow {
         ev: &ChestMark,
         pos_history: &[(f32, f32, std::time::Instant)],
         floor_idx: Option<usize>,
+        recent: &mut Vec<(f64, f64, std::time::Instant)>,
     ) -> Option<String> {
         let (cx, cy) = xf.apply(md.origin, ev.x, ev.z);
         let done_set = completed.get(&(bucket, md.map_id));
@@ -2962,6 +3017,8 @@ impl MapWindow {
             }).count();
             if dwell >= 3 {
                 completed.entry((bucket, md.map_id)).or_default().insert(pin.id);
+                // Flash ring feedback at the marked challenge pin.
+                recent.push((pin.x, pin.y, std::time::Instant::now()));
                 let name = pd.labels.iter().find(|l| l.id == pin.label_id)
                     .map(|l| l.name.clone()).unwrap_or_else(|| "Challenge".into());
                 tracing::info!("challenge completed: {name} (dwell {dwell}, event {d_event:.0}px)");
@@ -2974,7 +3031,7 @@ impl MapWindow {
         let name = Self::match_pin(
             md, pd, completed, bucket, xf,
             ev.x, ev.z, 60.0, &chest_labels, Some(ev.kind.as_str()),
-            floor_idx,
+            floor_idx, recent,
         )?;
         tracing::info!("auto-collected: {name}");
         Some(format!("✓ {name} auto-collected"))
@@ -2992,6 +3049,7 @@ impl MapWindow {
         label_ids: &std::collections::HashSet<u32>,
         hint: Option<&str>,
         floor_idx: Option<usize>,
+        recent: &mut Vec<(f64, f64, std::time::Instant)>,
     ) -> Option<String> {
         let r = radius;
         let (cx, cy) = xf.apply(md.origin, x, z);
@@ -2999,7 +3057,7 @@ impl MapWindow {
 
         let done_set = completed.get(&(bucket, md.map_id));
 
-        let mut best: Option<(f64, u64, u32)> = None; // (effective dist, pin id, label)
+        let mut best: Option<(f64, u64, u32, f64, f64)> = None; // (effective dist, pin id, label, px, py)
         for idx in cands {
             let pin = &pd.pins[idx];
             if !label_ids.contains(&pin.label_id) { continue; }
@@ -3016,11 +3074,13 @@ impl MapWindow {
                 _ => d,
             };
             if best.as_ref().map(|(bd, ..)| eff < *bd).unwrap_or(true) {
-                best = Some((eff, pin.id, pin.label_id));
+                best = Some((eff, pin.id, pin.label_id, pin.x, pin.y));
             }
         }
-        let (_, pin_id, label_id) = best?;
+        let (_, pin_id, label_id, px, py) = best?;
         completed.entry((bucket, md.map_id)).or_default().insert(pin_id);
+        // Flash ring feedback at the exact marked pin.
+        recent.push((px, py, std::time::Instant::now()));
         let name = pd.labels.iter().find(|l| l.id == label_id)
             .map(|l| l.name.clone()).unwrap_or_else(|| "Pin".into());
         Some(name)
@@ -3048,9 +3108,19 @@ impl MapWindow {
                icons: &HashMap<u32, egui::TextureHandle>, changed: &mut bool,
                completed: &std::collections::HashSet<u64>,
                bulk: &mut Option<(u32, bool)>,
-               search: &mut String) {
+               search: &mut String,
+               flash_secs: &mut f32) {
         ui.heading("📋 Pin Filters");
         if ui.checkbox(&mut filter.hide_completed, "Hide collected").changed() { *changed = true; }
+        ui.horizontal(|ui| {
+            ui.label("✨ flash");
+            ui.add(
+                egui::DragValue::new(flash_secs)
+                    .range(0.0..=30.0)
+                    .speed(0.5)
+                    .suffix(" s"),
+            );
+        });
         if ui.checkbox(&mut filter.flatten_layers, "Show all layers' pins")
             .on_hover_text(
                 "Ignore layer partitioning: every pin renders fully \
@@ -3190,7 +3260,9 @@ impl MapWindow {
               auto_notes: &[(String, std::time::Instant)],
               quick_toggle: &mut Option<(u64, u32)>,
               center_request: &mut Option<(f64, f64)>,
-              auto_map: &mut bool) {
+              auto_map: &mut bool,
+              recent_collected: &[(f64, f64, std::time::Instant)],
+              flash_secs: f32) {
         ui.horizontal(|ui| {
             ui.checkbox(follow, "📍 follow")
                 .on_hover_text(
@@ -3525,6 +3597,53 @@ impl MapWindow {
             painter.text(pos, egui::Align2::RIGHT_TOP, txt,
                 egui::FontId::proportional(12.0),
                 egui::Color32::from_rgba_unmultiplied(120, 255, 150, alpha));
+        }
+
+        // ── Recent auto-collect flashes ──
+        // A fading red ring at each recently auto-collected pin —
+        // shows WHAT got marked and where, fading over the configured
+        // duration.
+        if flash_secs > 0.05 {
+            for (x, y, t) in recent_collected {
+                let age = t.elapsed().as_secs_f32();
+                if age >= flash_secs {
+                    continue;
+                }
+                let k = 1.0 - age / flash_secs; // 1 → 0 fade
+                let p = to_screen(*x, *y);
+                if !rect.contains(p) {
+                    continue;
+                }
+                // Gentle growth + fade (repaint cadence is 4 Hz, so no
+                // fast pulsing).
+                let r = 24.0 + 14.0 * age / flash_secs;
+                painter.circle_stroke(
+                    p,
+                    r,
+                    egui::Stroke::new(
+                        2.5,
+                        egui::Color32::from_rgba_unmultiplied(
+                            255,
+                            60,
+                            60,
+                            (215.0 * k.min(1.0)) as u8,
+                        ),
+                    ),
+                );
+                painter.circle_stroke(
+                    p,
+                    r + 5.0,
+                    egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(
+                            255,
+                            60,
+                            60,
+                            (110.0 * k.min(1.0)) as u8,
+                        ),
+                    ),
+                );
+            }
         }
 
         // ── Player dot ──
