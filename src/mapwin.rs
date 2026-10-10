@@ -2997,6 +2997,21 @@ impl MapWindow {
         let (cx, cy) = xf.apply(md.origin, ev.x, ev.z);
         let done_set = completed.get(&(bucket, md.map_id));
 
+        // Dedup against the exact interact path: if a pin was already
+        // marked within the last few seconds near this event, the chest
+        // was handled at its exact gadget position — the fuzzy
+        // player-position match must not mark a SECOND, different pin.
+        if recent.iter().any(|(rx, ry, t)| {
+            t.elapsed().as_secs_f32() < 4.0
+                && ((rx - cx).powi(2) + (ry - cy).powi(2)).sqrt() <= 120.0
+        }) {
+            tracing::debug!(
+                "chest event near a just-marked pin — already handled, \
+                 skipping"
+            );
+            return None;
+        }
+
         let challenge_labels = pd.semantic_labels(PinCategory::Challenges);
 
         // ── Rule 1: challenge dwell anchor ──
