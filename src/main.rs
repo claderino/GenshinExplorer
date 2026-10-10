@@ -259,12 +259,20 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
 
         // Gadget entity registry (for interact matching).
         let mut gadget_entities: HashMap<u64, ()> = HashMap::new();
-        // Gadget entity registry (entity_id → gadget_id + world
-        // position), built from SceneEntityAppearNotify (27685) —
+        // Gadget entity registry (entity_id → gadget_id + group_id +
+        // world position), built from SceneEntityAppearNotify (27685) —
         // resolves GadgetInteractRsp entity ids to exact gadget
-        // positions.
-        let mut gadget_registry: HashMap<u64, (u64, f32, f32, f32)> =
+        // positions; group ids resolve challenge gadgets.
+        let mut gadget_registry: HashMap<u64, (u64, u64, f32, f32, f32)> =
             HashMap::new();
+        // Resolved challenge start positions by challenge_index —
+        // the finish notify carries no position, so the BEGIN resolves
+        // it (recent interact > registry group scan > player pos).
+        let mut challenge_pos: HashMap<u64, (f32, f32)> = HashMap::new();
+        // Most recent interact's world position (challenge starters are
+        // F-pressed right before the begin notify).
+        let mut last_interact_world: Option<(f32, f32, std::time::Instant)> =
+            None;
         // Command census + small-command capture (pattern learning).
         let mut census: HashMap<u16, (u64, Option<String>)> = HashMap::new();
         let mut last_census = std::time::Instant::now();
@@ -973,19 +981,95 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                             }
                         }
 
-                        // Challenge result (20234-shape): field 10 = 2 means
-                        // completed — mark the challenge pin instantly at the
-                        // player's position (they are at the challenge).
+                        // Challenge result (20234-shape): field 10 = 2
+                        // means completed — mark the challenge pin at the
+                        // CHALLENGE'S position if the begin resolved one
+                        // (recent interact on the starter / registry group
+                        // member); the player's position is only the
+                        // fallback (they're often at the GOAL, far from
+                        // the pinned start).
                         if let Some(result) = explore::detect_challenge_result(command) {
                             tracing::info!(
-                                "challenge {} ({}s / goal {})",
+                                "challenge {} ({}s / index {})",
                                 if result.success { "SUCCESS" } else { "failed" },
                                 result.seconds, result.goal
                             );
                             if result.success {
-                                if let Some((px, _py, pz)) = pos_tracker.last {
-                                    let _ = tx.send(Msg::ChallengeDone { x: px, z: pz });
+                                // The finish notify has no position; the
+                                // begin (7266) resolved the start. Field 4
+                                // is challenge_index — prefer this
+                                // challenge's entry, else any single
+                                // stored one (most challenges are solo).
+                                let resolved = challenge_pos
+                                    .get(&result.goal)
+                                    .copied()
+                                    .or_else(|| {
+                                        if challenge_pos.len() == 1 {
+                                            challenge_pos.values().next().copied()
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                match resolved {
+                                    Some((cx, cz)) => {
+                                        let _ = tx.send(Msg::ChallengeDone { x: cx, z: cz });
+                                        challenge_pos.clear();
+                                    }
+                                    None => {
+                                        if let Some((px, _py, pz)) = pos_tracker.last {
+                                            let _ = tx.send(Msg::ChallengeDone { x: px, z: pz });
+                                        }
+                                    }
                                 }
+                            }
+                        }
+
+                        // Challenge begin (7266): resolve the challenge
+                        // START position now — the finish notify carries
+                        // no position. Resolution: the recent interact
+                        // that started it (F-press on the starter gadget)
+                        // > any registry gadget in the begin's group >
+                        // the player's position.
+                        if let Some(begin) = explore::detect_challenge_begin(command) {
+                            let pos = if let Some((ix, iz, t)) = last_interact_world {
+                                if t.elapsed() < Duration::from_secs(5) {
+                                    Some((ix, iz))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            let pos = pos.or_else(|| {
+                                let pp = pos_tracker.last?;
+                                gadget_registry
+                                    .iter()
+                                    .filter(|(_, (_, g, ..))| {
+                                        *g == begin.group_id
+                                    })
+                                    .min_by(|a, b| {
+                                        let da = ((a.1 .2 - pp.0).powi(2)
+                                            + (a.1 .4 - pp.2).powi(2));
+                                        let db = ((b.1 .2 - pp.0).powi(2)
+                                            + (b.1 .4 - pp.2).powi(2));
+                                        da.partial_cmp(&db)
+                                            .unwrap_or(std::cmp::Ordering::Equal)
+                                    })
+                                    .map(|(_, v)| (v.2, v.4))
+                            });
+                            let pos = pos.or_else(|| {
+                                pos_tracker.last.map(|(x, _y, z)| (x, z))
+                            });
+                            if let Some(p) = pos {
+                                if challenge_pos.len() > 8 {
+                                    challenge_pos.clear();
+                                }
+                                challenge_pos.insert(begin.challenge_index, p);
+                                tracing::debug!(
+                                    index = begin.challenge_index,
+                                    group = begin.group_id,
+                                    "challenge begin — start position resolved"
+                                );
                             }
                         }
 
@@ -1288,6 +1372,7 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                 spawn.entity_id,
                                 (
                                     spawn.gadget_id,
+                                    spawn.group_id,
                                     spawn.x,
                                     spawn.y,
                                     spawn.z,
@@ -1353,7 +1438,7 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                     inter.entity_id,
                                     std::time::Instant::now(),
                                 ));
-                                if let Some(&(_, x, _y, z)) =
+                                if let Some(&(_, _, x, _y, z)) =
                                     gadget_registry.get(&inter.entity_id)
                                 {
                                     tracing::debug!(
@@ -1361,6 +1446,8 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                         ty = inter.interact_type,
                                         "gadget interact resolved"
                                     );
+                                    last_interact_world =
+                                        Some((x, z, std::time::Instant::now()));
                                     let _ = tx.send(Msg::GadgetInteract {
                                         x,
                                         z,
@@ -1381,10 +1468,10 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                         // candidate logging (learn mode: the court gadget
                         // id + done-state get promoted to auto-marking
                         // once observed).
-                        if let Some((entity_id, state)) =
+                            if let Some((entity_id, state)) =
                             explore::detect_gadget_state(command)
                         {
-                            if let Some(&(_, x, _y, z)) =
+                            if let Some(&(_, _, x, _y, z)) =
                                 gadget_registry.get(&entity_id)
                             {
                                 let gid = gadget_registry

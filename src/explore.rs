@@ -414,7 +414,7 @@ pub fn detect_challenge_result(cmd: &GameCommand) -> Option<ChallengeResult> {
 pub struct GadgetSpawn {
     pub entity_id: u64,
     pub gadget_id: u64,
-    pub config_id: u64,
+    pub group_id: u64,
     pub x: f32,
     pub y: f32,
     pub z: f32,
@@ -545,7 +545,7 @@ pub fn detect_gadget_spawns(cmd: &GameCommand) -> Vec<GadgetSpawn> {
         let mut entity_id = None;
         let mut pos = None;
         let mut gadget_id = None;
-        let mut config_id = None;
+        let mut group_id = None;
         for (ef, ev) in &entity {
             match *ef {
                 1 => entity_type = ev.as_varint(),
@@ -570,7 +570,7 @@ pub fn detect_gadget_spawns(cmd: &GameCommand) -> Vec<GadgetSpawn> {
                             for (gfn, gv) in &gf {
                                 match *gfn {
                                     1 => gadget_id = gv.as_varint(),
-                                    3 => config_id = gv.as_varint(),
+                                    2 => group_id = gv.as_varint(),
                                     _ => {}
                                 }
                             }
@@ -586,7 +586,7 @@ pub fn detect_gadget_spawns(cmd: &GameCommand) -> Vec<GadgetSpawn> {
                 out.push(GadgetSpawn {
                     entity_id: id,
                     gadget_id: gadget_id.unwrap_or(0),
-                    config_id: config_id.unwrap_or(0),
+                    group_id: group_id.unwrap_or(0),
                     x,
                     y,
                     z,
@@ -595,6 +595,37 @@ pub fn detect_gadget_spawns(cmd: &GameCommand) -> Vec<GadgetSpawn> {
         }
     }
     out
+}
+
+/// DungeonChallengeBeginNotify (7266): `{6: group_id, 12:
+/// challenge_index, 13: challenge_id}` — fired when a challenge
+/// starts. Used to resolve the challenge gadget's position (via the
+/// recent interact that started it, or the registry's group members)
+/// so the completion marks the CHALLENGE pin, not the player spot.
+#[derive(Debug, Clone)]
+pub struct ChallengeBegin {
+    pub group_id: u64,
+    pub challenge_index: u64,
+}
+
+pub fn detect_challenge_begin(cmd: &GameCommand) -> Option<ChallengeBegin> {
+    if cmd.command_id != 7266 {
+        return None;
+    }
+    let fields = parse(&cmd.proto_data)?;
+    let mut group_id = None;
+    let mut index = None;
+    for (f, v) in &fields {
+        match *f {
+            6 => group_id = v.as_varint(),
+            12 => index = v.as_varint(),
+            _ => {}
+        }
+    }
+    Some(ChallengeBegin {
+        group_id: group_id?,
+        challenge_index: index?,
+    })
 }
 
 /// GadgetStateNotify (22292): `{3: gadget_entity_id, 7: gadget_state}` —
