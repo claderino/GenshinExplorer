@@ -1287,18 +1287,62 @@ impl MapWindow {
                             let events =
                                 std::mem::take(&mut self.pending_interacts);
                             for (x, z, ty, gid) in &events {
-                                if !matches!(ty, 3 | 8) {
-                                    continue; // chest family only
+                                // Per-type label sets: chests (exact tier
+                                // hint), viewpoints (VIEW=7), obelisks
+                                // (DESHRET_OBELISK=16). GATHER (2) and
+                                // PICK_ITEM (1) are deliberately skipped —
+                                // plants respawn (marking is wrong) and
+                                // pick events are noisy (drops, quest
+                                // items).
+                                let labels: std::collections::HashSet<u32>;
+                                let mut radius = 30.0;
+                                match ty {
+                                    3 | 8 => {
+                                        labels = pd
+                                            .semantic_labels(
+                                                PinCategory::Chests,
+                                            );
+                                    }
+                                    7 => {
+                                        labels = pd
+                                            .labels
+                                            .iter()
+                                            .filter(|l| {
+                                                l.name
+                                                    .to_lowercase()
+                                                    .contains("viewpoint")
+                                            })
+                                            .map(|l| l.id)
+                                            .collect();
+                                        radius = 60.0;
+                                    }
+                                    16 => {
+                                        labels = pd
+                                            .labels
+                                            .iter()
+                                            .filter(|l| {
+                                                l.name.to_lowercase()
+                                                    .contains("obelisk")
+                                            })
+                                            .map(|l| l.id)
+                                            .collect();
+                                        radius = 60.0;
+                                    }
+                                    _ => continue,
+                                }
+                                if labels.is_empty() {
+                                    continue;
                                 }
                                 // Exact chest tier from the gadget
                                 // config id — much stronger than the
                                 // Mora heuristic.
-                                let hint = crate::explore::chest_tier_from_gadget_id(
-                                    *gid,
-                                );
+                                let hint =
+                                    crate::explore::chest_tier_from_gadget_id(
+                                        *gid,
+                                    );
                                 if let Some(name) = Self::match_pin(
                                     &md, pd, &mut self.completed, bucket,
-                                    xf, *x, *z, 30.0, &chest_labels, hint,
+                                    xf, *x, *z, radius, &labels, hint,
                                     self.active_floor,
                                     &mut self.recent_collected,
                                 ) {
