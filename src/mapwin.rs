@@ -312,6 +312,12 @@ pub struct MapWindow {
     /// Recently auto-collected pins (canvas px + time) — drawn as a
     /// fading red ring so the user sees WHAT got marked and where.
     recent_collected: Vec<(f64, f64, std::time::Instant)>,
+    /// Recently SEEN gadget interacts (world x, z + time) — the
+    /// client's F-press request hits the wire before any server
+    /// response, so a sighting here guarantees the interact path will
+    /// (or already did) handle this chest: the fuzzy player-position
+    /// path stands down nearby.
+    recent_interact_worlds: Vec<(f32, f32, std::time::Instant)>,
     /// How long the collect flash ring stays visible (seconds).
     collect_flash_secs: f32,
     /// Gadget interact events (881 Rsp) awaiting pin matching —
@@ -460,6 +466,7 @@ impl MapWindow {
             pending_layer: None,
             pending_interacts: Vec::new(),
             recent_collected: Vec::new(),
+            recent_interact_worlds: Vec::new(),
             collect_flash_secs: Self::load_settings().collect_flash_secs,
             pin_match_retired: false,
             layer_authoritative_at: None,
@@ -492,6 +499,15 @@ impl MapWindow {
     /// Queue a server-confirmed gadget interaction for exact-position
     /// pin matching.
     pub fn note_gadget_interact(&mut self, x: f32, z: f32, ty: u64) {
+        // Sighting recorded at MESSAGE-ARRIVAL time (before the frame
+        // processes either queue): KCP is an ordered stream, so a chest's
+        // GadgetInteractRsp always precedes its ItemAdd — recording here
+        // means the fuzzy chest path's gate sees the sighting even when
+        // both events land in the same frame.
+        self.recent_interact_worlds.push((x, z, std::time::Instant::now()));
+        self.recent_interact_worlds.retain(|(_, _, t)| {
+            t.elapsed().as_secs_f32() < 10.0
+        });
         if self.pending_interacts.len() >= 50 {
             self.pending_interacts.remove(0);
         }
@@ -1191,12 +1207,41 @@ impl MapWindow {
                             let events = std::mem::take(&mut self.pending_chests);
                             for ev in &events {
                                 let (cx, cy) = xf.apply(md.origin, ev.x, ev.z);
+                                // Interact-sighting gate: if a gadget
+                                // interact was SEEN near this event
+                                // recently, the exact interact path owns
+                                // it (or intentionally matched nothing) —
+                                // the fuzzy player-position match must
+                                // not mark a different pin.
+                                let near_interact = self
+                                    .recent_interact_worlds
+                                    .iter()
+                                    .any(|(ix, iz, t)| {
+                                        t.elapsed().as_secs_f32() < 6.0
+                                            && {
+                                                let (icx, icy) = xf.apply(
+                                                    md.origin, *ix, *iz,
+                                                );
+                                                ((icx - cx).powi(2)
+                                                    + (icy - cy)
+                                                        .powi(2))
+                                                .sqrt()
+                                                    <= 150.0
+                                            }
+                                    });
                                 let near_recent_challenge = self.recent_challenge_done
                                     .iter()
                                     .any(|(rx, ry, _)| {
                                         ((rx - cx).powi(2) + (ry - cy).powi(2)).sqrt() <= 250.0
                                     });
-                                let note = if near_recent_challenge {
+                                let note = if near_interact {
+                                    tracing::debug!(
+                                        "chest event near a seen gadget \
+                                         interact — exact path owns it, \
+                                         skipping fuzzy match"
+                                    );
+                                    None
+                                } else if near_recent_challenge {
                                     tracing::debug!("chest event near recent challenge — spawned reward, skipping");
                                     None
                                 } else {
@@ -3624,7 +3669,7 @@ impl MapWindow {
                 if age >= flash_secs {
                     continue;
                 }
-                let k = 1.0 - age / flash_secs; // 1 → 0 fade
+                let k = 1.0f32 - age / flash_secs; // 1 → 0 fade
                 let p = to_screen(*x, *y);
                 if !rect.contains(p) {
                     continue;
