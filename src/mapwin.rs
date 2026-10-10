@@ -3246,6 +3246,31 @@ impl MapWindow {
 
         let done_set = completed.get(&(bucket, md.map_id));
 
+        // Nearest-raw-distance candidate: if the CLOSEST pin is already
+        // collected, this event is (almost certainly) a duplicate of an
+        // already-handled collection — marking the runner-up neighbor
+        // instead is how one chest open used to mark two pins.
+        let mut nearest: Option<(f64, u64)> = None; // (raw dist, pin id)
+        for idx in &cands {
+            let pin = &pd.pins[*idx];
+            if !label_ids.contains(&pin.label_id) { continue; }
+            if !Self::pin_on_active_floor(pd, floor_idx, pin.id) { continue; }
+            let d = ((pin.x - cx).powi(2) + (pin.y - cy).powi(2)).sqrt();
+            if d > r { continue; }
+            if nearest.map(|(bd, _)| d < bd).unwrap_or(true) {
+                nearest = Some((d, pin.id));
+            }
+        }
+        if let Some((_, nearest_id)) = nearest {
+            if done_set.map(|s| s.contains(&nearest_id)).unwrap_or(false) {
+                tracing::debug!(
+                    "nearest pin {nearest_id} already collected — \
+                     duplicate event, skipping"
+                );
+                return None;
+            }
+        }
+
         let mut best: Option<(f64, u64, u32, f64, f64)> = None; // (effective dist, pin id, label, px, py)
         for idx in cands {
             let pin = &pd.pins[idx];

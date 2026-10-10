@@ -292,6 +292,10 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
         // fresh direct-carrier fixes (ground truth): a big divergence
         // means the learned id is following an NPC, not the player.
         let mut player_batch_pos: Option<(f32, f32, f32)> = None;
+        // Last gadget interact (entity, time) — duplicate Rsp
+        // suppression for the auto-collect path.
+        let mut last_interact_entity: Option<(u64, std::time::Instant)> =
+            None;
         // Avatar-scene UID votes → identifies the in-game account (7.x
         // removed user_id from wire headers).
         let mut uid_votes: HashMap<u32, u32> = HashMap::new();
@@ -1299,26 +1303,42 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                         if let Some(inter) =
                             explore::detect_gadget_interact(command)
                         {
-                            if let Some(&(_, x, _y, z)) =
-                                gadget_registry.get(&inter.entity_id)
-                            {
-                                tracing::debug!(
-                                    entity = inter.entity_id,
-                                    ty = inter.interact_type,
-                                    "gadget interact resolved"
-                                );
-                                let _ = tx.send(Msg::GadgetInteract {
-                                    x,
-                                    z,
-                                    interact_type: inter.interact_type,
-                                    gadget_id: inter.gadget_id,
-                                });
-                            } else {
-                                tracing::debug!(
-                                    entity = inter.entity_id,
-                                    "gadget interact — entity not in \
-                                     registry (spawned before capture?)"
-                                );
+                            // Duplicate suppression: the same entity's
+                            // Rsp retriggering within 2s (retransmit or
+                            // overlap) must not re-mark.
+                            let dup = last_interact_entity
+                                .map(|(eid, t)| {
+                                    eid == inter.entity_id
+                                        && t.elapsed()
+                                            < Duration::from_millis(2000)
+                                })
+                                .unwrap_or(false);
+                            if !dup {
+                                last_interact_entity = Some((
+                                    inter.entity_id,
+                                    std::time::Instant::now(),
+                                ));
+                                if let Some(&(_, x, _y, z)) =
+                                    gadget_registry.get(&inter.entity_id)
+                                {
+                                    tracing::debug!(
+                                        entity = inter.entity_id,
+                                        ty = inter.interact_type,
+                                        "gadget interact resolved"
+                                    );
+                                    let _ = tx.send(Msg::GadgetInteract {
+                                        x,
+                                        z,
+                                        interact_type: inter.interact_type,
+                                        gadget_id: inter.gadget_id,
+                                    });
+                                } else {
+                                    tracing::debug!(
+                                        entity = inter.entity_id,
+                                        "gadget interact — entity not in \
+                                         registry (spawned before capture?)"
+                                    );
+                                }
                             }
                         }
 
