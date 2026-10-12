@@ -1,18 +1,30 @@
-# Release build: push a tag (v*) to publish, or run manually from the
-# Actions tab for an artifact-only build.
-#
-# The exe is self-contained: dispatch keys (keys/), the command-name
-# table (src/cmd_names.rs), the embedded emoji font (assets/) and the
-# default calibrations/layer mappings (defaults/) are all compiled in.
+# Release: builds, tests and publishes a GitHub Release with the
+# version-stamped exe. Two triggers:
+#  * Push a tag (v*) — version comes from the tag.
+#  * Manual dispatch (Actions → Release → Run workflow) with an
+#    optional version input — empty input auto-bumps the PATCH of the
+#    latest release (v0.2.1 → v0.2.2). The release is created on the
+#    current commit; GitHub creates the tag implicitly, so no push
+#    event re-triggers this workflow.
+# The version is embedded into the exe's Details tab (FileVersion /
+# ProductVersion) via APP_VERSION + build.rs.
 name: Release
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (e.g. v0.2.0) — leave empty to bump patch from the latest release"
+        required: false
+        default: ""
 
 permissions:
   contents: write
+
+env:
+  EXE: genshin-explorer
 
 jobs:
   release:
@@ -20,11 +32,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = "${{ inputs.version }}".Trim()
+          if (-not $v) {
+            # Auto-bump: latest release's patch + 1 (no releases yet → v0.1.0)
+            $latest = "v0.1.0"
+            try {
+              $latest = (gh api "repos/$env:GITHUB_REPOSITORY/releases/latest" --jq .tag_name) 2>$null
+              if (-not $latest) { $latest = "v0.1.0" }
+            } catch { $latest = "v0.1.0" }
+            if (-not $latest.StartsWith("v")) { $latest = "v" + $latest }
+            $parts = $latest.TrimStart("v").Split(".")
+            $patch = if ($parts.Count -ge 3) { [int]$parts[2] } else { 0 }
+            $v = "v$($parts[0]).$($parts[1]).$($patch + 1)"
+          }
+          if (-not $v.StartsWith("v")) { $v = "v" + $v }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "Version: $v"
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build (release)
+      - name: Build (release, version-stamped)
+        env:
+          APP_VERSION: ${{ steps.ver.outputs.version }}
         run: cargo build --release --verbose
 
       - name: Tests
@@ -32,10 +67,11 @@ jobs:
 
       - name: Package
         shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          $tag = if ("$env:GITHUB_REF_TYPE" -eq "tag") { "$env:GITHUB_REF_NAME" } else { "dev-$($env:GITHUB_SHA.Substring(0,7))" }
-          $zip = "genshin-explorer-$tag-x86_64-windows.zip"
-          Compress-Archive -Path target/release/genshin-explorer.exe -DestinationPath $zip
+          $zip = "$env:EXE-$env:APP_VERSION-x86_64-windows.zip"
+          Compress-Archive -Path "target/release/$env:EXE.exe" -DestinationPath $zip
           "zip=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Upload artifact
@@ -45,8 +81,9 @@ jobs:
           path: ${{ env.zip }}
 
       - name: Create GitHub release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.ver.outputs.version }}
+          name: ${{ steps.ver.outputs.version }}
           files: ${{ env.zip }}
           generate_release_notes: true
