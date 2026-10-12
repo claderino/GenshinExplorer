@@ -85,5 +85,7 @@ jobs:
         with:
           tag_name: ${{ steps.ver.outputs.version }}
           name: ${{ steps.ver.outputs.version }}
-          files: ${{ env.zip }}
+          files: |
+            ${{ env.zip }}
+            target/release/${{ env.EXE }}.exe
           generate_release_notes: true
