@@ -121,7 +121,7 @@ pub struct GameRole {
 pub fn region_display(region: &str) -> &'static str {
     match region {
         "os_usa" => "America",
-        "os_eu" => "Europe",
+        "os_eu" | "os_euro" => "Europe",
         "os_asia" => "Asia",
         "os_cht" => "TW/HK/MO",
         _ => "Unknown",
@@ -200,7 +200,15 @@ fn fetch_roles_once(
             .or_else(|| {
                 it.get("region").and_then(|v| v.as_str()).map(String::from)
             })
-            .unwrap_or_else(|| "os_usa".into());
+            .map(|r| normalize_region(&r))
+            .filter(|r| {
+                matches!(r.as_str(), "os_usa" | "os_eu" | "os_asia" | "os_cht")
+            })
+            // The unfiltered response labels roles with region strings
+            // that vary between HoYoLab endpoints (observed variants do
+            // not always match the canonical codes). The UID's first
+            // digit is authoritative — fall back to it.
+            .unwrap_or_else(|| region_for_uid(uid).to_string());
         roles.push(GameRole {
             uid,
             region,
@@ -271,6 +279,18 @@ fn region_for_uid(uid: u32) -> &'static str {
         8 => "os_asia",
         9 => "os_cht",
         _ => "os_usa",
+    }
+}
+
+/// Canonicalize region-code variants seen across HoYoLab endpoints
+/// (e.g. `os_euro` on the game-record API vs `os_eu` on binding).
+fn normalize_region(r: &str) -> String {
+    match r {
+        "os_euro" | "eu" | "os-eu" => "os_eu".into(),
+        "usa" | "os-usa" => "os_usa".into(),
+        "asia" | "os-asia" => "os_asia".into(),
+        "cht" | "os-cht" | "os_cht" => "os_cht".into(),
+        other => other.into(),
     }
 }
 
