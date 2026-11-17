@@ -484,7 +484,9 @@ pub fn detect_avatar_entities(cmd: &GameCommand) -> Vec<AvatarEntity> {
         return out;
     };
     for (f, v) in &fields {
-        if *f != 8 {
+        // Entity list: field 2 since 7.2 (verified from runtime dumps),
+        // field 8 up to 7.1 — accept both.
+        if !matches!(*f, 2 | 8) {
             continue;
         }
         let Some(bytes) = v.as_bytes() else { continue };
@@ -577,7 +579,9 @@ pub fn detect_gadget_spawns(cmd: &GameCommand) -> Vec<GadgetSpawn> {
         return out;
     };
     for (f, v) in &fields {
-        if *f != 8 {
+        // Entity list: field 2 since 7.2 (verified from runtime dumps),
+        // field 8 up to 7.1 — accept both.
+        if !matches!(*f, 2 | 8) {
             continue;
         }
         let Some(bytes) = v.as_bytes() else { continue };
