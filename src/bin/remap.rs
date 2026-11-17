@@ -261,6 +261,32 @@ struct CmdStats {
     total_len: u64,
 }
 
+/// Recursive search for `{1: uid, 2: avatar_id}` with the exact uid;
+/// records the field-number path taken.
+fn find_avatar(buf: &[u8], uid: u64, path: &mut Vec<u32>, depth: u32) -> bool {
+    if depth > 5 {
+        return false;
+    }
+    let Some(fs) = parse(buf) else { return false };
+    let f1 = fs.iter().find(|(f, _)| *f == 1).and_then(|(_, v)| v.varint());
+    let f2 = fs.iter().find(|(f, _)| *f == 2).and_then(|(_, v)| v.varint());
+    if let (Some(a), Some(b)) = (f1, f2) {
+        if a == uid && (10_000_000..=13_000_000).contains(&b) {
+            return true;
+        }
+    }
+    for (n, v) in &fs {
+        if let Some(sub) = v.bytes() {
+            path.push(*n);
+            if find_avatar(sub, uid, path, depth + 1) {
+                return true;
+            }
+            path.pop();
+        }
+    }
+    false
+}
+
 fn parse_partial_dbg(buf: &[u8]) -> Option<Fields> {
     let mut fields = Vec::new();
     let mut i = 0usize;
@@ -284,9 +310,52 @@ fn parse_partial_dbg(buf: &[u8]) -> Option<Fields> {
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
-        eprintln!("usage: remap <file.jsonl> <ts-prefix> | remap --check <hex>");
+        eprintln!("usage: remap <file> <ts-prefix> | remap --check <hex> | remap --uid <file> <prefix> <uid>");
         std::process::exit(2);
     };
+    if path == "--uid" {
+        // Find payloads containing a SceneAvatarInfo-ish {1: uid, 2:
+        // avatar_id} for the given uid at any depth; print the enclosing
+        // message's field layout so the carrier structure is readable.
+        let file = args.next().expect("file");
+        let prefix = args.next().unwrap_or_default();
+        let uid: u64 = args.next().expect("uid").parse().expect("uid");
+        let reader =
+            std::io::BufReader::new(std::fs::File::open(&file).expect("open"));
+        let mut found = 0u32;
+        'outer: for line in reader.lines() {
+            let Ok(line) = line else { break };
+            if !line.contains(&prefix) {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let Some(cmd) = v
+                .get("cmd")
+                .or_else(|| v.get("command_id"))
+                .and_then(|x| x.as_u64())
+            else { continue };
+            let Some(hex) = v.get("hex").and_then(|x| x.as_str()) else { continue };
+            let buf = hexbytes(hex);
+            // Path of field numbers from root to the avatar submessage.
+            let mut path: Vec<u32> = Vec::new();
+            if find_avatar(&buf, uid, &mut path, 0) {
+                println!("cmd {cmd}: path={path:?} len={}", buf.len());
+                if let Some(top) = parse(&buf) {
+                    println!("   top: {:?}", top.iter().map(|(n, v)| (*n, match v {
+                        Val::Bytes(b) => format!("b:{}", b.len()),
+                        Val::Varint(x) => format!("v:{x}"),
+                        _ => "fx".into(),
+                    })).collect::<Vec<_>>());
+                }
+                found += 1;
+                if found >= 12 { break 'outer; }
+            }
+        }
+        if found == 0 { println!("no payloads carry uid {uid}"); }
+        return;
+    }
     if path == "--check" {
         let hex = args.next().unwrap_or_default();
         let buf = hexbytes(&hex);

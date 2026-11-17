@@ -529,6 +529,36 @@ pub fn detect_avatar_entities(cmd: &GameCommand) -> Vec<AvatarEntity> {
     out
 }
 
+/// Recursive search for a `{1: uid, 2: avatar_id}` submessage with the
+/// EXACT uid at any depth; returns the field-number path from the root
+/// to it (the appear-packet layout varies across versions — 7.2 rotated
+/// cmds AND reshuffled the outer nesting, so the structure must be
+/// discovered at runtime where payloads are not truncated).
+pub fn find_uid_shape(buf: &[u8], uid: u32, depth: u32) -> Option<Vec<u32>> {
+    if depth > 6 || buf.is_empty() {
+        return None;
+    }
+    let Some(fields) = parse_partial(buf).map(|(f, _)| f) else {
+        return None;
+    };
+    let f1 = fields.iter().find(|(f, _)| *f == 1).and_then(|(_, v)| v.as_varint());
+    let f2 = fields.iter().find(|(f, _)| *f == 2).and_then(|(_, v)| v.as_varint());
+    if let (Some(a), Some(b)) = (f1, f2) {
+        if a == uid as u64 && (10_000_000..=13_000_000).contains(&b) {
+            return Some(Vec::new());
+        }
+    }
+    for (num, value) in &fields {
+        if let Some(sub) = value.as_bytes() {
+            if let Some(mut path) = find_uid_shape(sub, uid, depth + 1) {
+                path.insert(0, *num);
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 /// Gadget spawns from SceneEntityAppearNotify-shaped payloads:
 /// `{8: [SceneEntityInfo]}` where gadget entities are
 /// `{1: type=4, 2: entity_id, 4: motion{1: pos{1,2,3}},

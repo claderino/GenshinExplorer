@@ -354,6 +354,11 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
             .create(true)
             .append(true)
             .open(data_dir.join("scenetransitions.jsonl"))?;
+        // Avatar-appear research dumps (full payloads, once per cmd).
+        let mut avatar_log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(data_dir.join("avatar_appear.jsonl"))?;
         let mut scene_capture_until: Option<std::time::Instant> = None;
         let mut scene_event: u64 = 0;
         let mut last_sent_pos: Option<(f32, f32, f32)> = None;
@@ -891,6 +896,55 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                 if count >= 3 {
                                     detected_uid = Some(best);
                                     let _ = tx.send(Msg::Uid(best));
+                                }
+                            }
+                        }
+
+                        // Avatar-appear research dump: packets carrying the
+                        // account uid's `{1: uid, 2: avatar_id}` shape ARE
+                        // the avatar appears; dump the FULL untruncated
+                        // payload once per cmd so the 7.2 layout can be
+                        // derived (fullcap truncates at 512 B, appears run
+                        // ~1 KB+, so offline analysis cannot see them).
+                        if let Some(uid) = detected_uid {
+                            if command.proto_data.len() >= 8 {
+                                if let Some(path) = explore::find_uid_shape(
+                                    &command.proto_data,
+                                    uid,
+                                    0,
+                                ) {
+                                    if carriers.insert((
+                                        "uid-shape",
+                                        command.command_id,
+                                    )) {
+                                        tracing::info!(
+                                            cmd = command.command_id,
+                                            path = ?path,
+                                            len = command.proto_data.len(),
+                                            "uid-shape carrier — dumped"
+                                        );
+                                        use std::io::Write;
+                                        let hex: String = command
+                                            .proto_data
+                                            .iter()
+                                            .map(|b| format!("{b:02x}"))
+                                            .collect();
+                                        let _ = writeln!(
+                                            avatar_log,
+                                            "{}",
+                                            serde_json::json!({
+                                                "ts": chrono::Local::now()
+                                                    .to_rfc3339_opts(
+                                                        chrono::SecondsFormat::Millis,
+                                                        true,
+                                                    ),
+                                                "cmd": command.command_id,
+                                                "path": path,
+                                                "len": command.proto_data.len(),
+                                                "hex": hex,
+                                            })
+                                        );
+                                    }
                                 }
                             }
                         }
