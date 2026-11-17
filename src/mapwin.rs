@@ -632,6 +632,15 @@ impl MapWindow {
         Self::data_dir().join("learned_map_layers.json")
     }
 
+    /// All known map-layer ids (defaults + user-learned), used by the
+    /// worker to gate cmd-agnostic `{4: layer_id}` candidates.
+    pub fn known_layer_ids() -> std::collections::HashSet<u64> {
+        Self::load_learned_layers()
+            .values()
+            .flat_map(|m| m.keys().copied())
+            .collect()
+    }
+
     /// Download (once) / load / cache a floor overlay texture. Returns the
     /// texture id when available.
     fn ensure_floor_overlay(

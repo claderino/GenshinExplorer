@@ -285,3 +285,26 @@ Only the Chasm (LightStone) and the moon (MoonFatigue) broadcast 6771 region
 features; the other four emit nothing — scene ids are their only signal.
 Cross-region canvas geometry is meaningless: e.g. the Chasm mines report small
 local coords like (402, 419, 396), overlapping every other region's canvas box.
+
+## 13. The 7.2 command-id rotation (2026-11-17)
+
+Genshin 7.2 re-randomized the ENTIRE command-id space, breaking every
+cmd-keyed detector (ids rotate each major version; message shapes do
+not). Verified against captures:
+
+- 7.1 cmd 2246 (batch movement) -> 7.2 cmd **24007** (same
+  EntityMoveInfo `{1: entity_id, 2: MotionInfo{1: Vector}}` shape; the
+  union nesting around it varies by build - f6->f9->f15 in the 7.1
+  doc sample, f3->f8 in other 7.1 lines - so the detector now accepts
+  the shape at depth <= 3 under any top-level bytes entry)
+- 7.1 heartbeat 25508 -> ~1 Hz small cmd **4955** (candidate, by rate)
+- mora/prop/item detection was already fully shape-based and survived
+  unchanged; region-feature + direct-position detectors were already
+  cmd-agnostic
+
+Fix philosophy going forward: ALL detectors are shape-based and
+cmd-agnostic (see explore.rs). The worker logs `carrier identified:
+<family> cmd=<id>` once per family per session, so the current
+mapping is always recoverable from app.log after any version bump.
+Still keyed on observed ids pending re-observation: challenge begin
+(was 7266), gadget state (was 22292), token-exchange dump (23252/3713).

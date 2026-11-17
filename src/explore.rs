@@ -152,39 +152,44 @@ pub struct Motion {
 /// Parse ALL batch entries from a command, returning (entity_id, position)
 /// pairs. Used to find the player's entries among the batch data once the
 /// player's entity_id is learned from the direct carrier.
+///
+/// Command-id agnostic (ids rotate every major version; 7.1's batch
+/// carrier was cmd 2246, 7.2's is a different id with the SAME
+/// EntityMoveInfo shape): each top-level bytes field is a batch entry;
+/// the EntityMoveInfo `{1: entity_id, 2: MotionInfo{1: Vector}}` shape is
+/// accepted at depth ≤3 under it because the union-command nesting
+/// varies between versions (7.1 used f6→f9→f15, other builds f3→f8).
 pub fn detect_batch_entries(cmd: &GameCommand) -> Vec<(u64, Motion)> {
     let mut out = Vec::new();
+    // Batch/movement packets are small; skip the big scene/login blobs.
+    if cmd.proto_data.len() > 4096 {
+        return out;
+    }
     let Some((fields, _)) = parse_partial(&cmd.proto_data) else {
         return out;
     };
-    // Iterate ALL field-8 entries (each is one entity's movement record).
     for (_, value) in &fields {
         let Some(entry_bytes) = value.as_bytes() else { continue };
-        let Some((entity_id, x, y, z)) = parse_batch_entry(entry_bytes) else {
-            continue;
-        };
-        if is_world_position(x, y, z) {
-            out.push((entity_id, Motion { entity_id, x, y, z }));
-        }
+        collect_move_entries(entry_bytes, &mut out, 0);
     }
     out
 }
 
-/// Parse one batch entry (field 8 content): f6 → f9 → f15 → {f1: id, f2: pos}
-fn parse_batch_entry(buf: &[u8]) -> Option<(u64, f32, f32, f32)> {
-    let (fields, _) = parse_partial(buf)?;
-    let f6 = find_bytes(&fields, 6)?;
-    let (f6_fields, _) = parse_partial(f6)?;
-    let f9 = find_bytes(&f6_fields, 9)?;
-    let (f9_fields, _) = parse_partial(f9)?;
-    let f15 = find_bytes(&f9_fields, 15)?;
-    let (f15_fields, _) = parse_partial(f15)?;
-    let entity_id = find_varint(&f15_fields, 1)?;
-    let motion_bytes = find_bytes(&f15_fields, 2)?;
-    let (motion_fields, _) = parse_partial(motion_bytes)?;
-    let vec_bytes = find_bytes(&motion_fields, 1)?;
-    let (x, y, z) = parse_vector(vec_bytes)?;
-    Some((entity_id, x, y, z))
+/// Search one batch entry (and its nested unions) for EntityMoveInfo
+/// shapes. Capped to keep per-packet work bounded.
+fn collect_move_entries(buf: &[u8], out: &mut Vec<(u64, Motion)>, depth: u32) {
+    if depth > 3 || out.len() >= 64 {
+        return;
+    }
+    if let Some(motion) = parse_entity_move(buf) {
+        out.push((motion.entity_id, motion));
+        return;
+    }
+    let Some((fields, _)) = parse_partial(buf) else { return };
+    for (_, value) in &fields {
+        let Some(sub) = value.as_bytes() else { continue };
+        collect_move_entries(sub, out, depth + 1);
+    }
 }
 
 /// EXACT-PATH position detection — uses ONLY the direct position carrier,
@@ -464,8 +469,14 @@ pub struct AvatarEntity {
     pub avatar_id: u32,
 }
 
+/// Avatar entities from SceneEntityAppearNotify-shaped payloads: `{8:
+/// [SceneEntityInfo]}` where avatar entities are `{1: type=1 (avatar),
+/// 2: entity_id, 10: SceneAvatarInfo{1: uid, 2: avatar_id}}`.
+/// Command-id agnostic — the cmd rotated in 7.2 (was 27685), the message
+/// shape did not; the shape itself (type=1 + uid + avatar_id) is the
+/// discriminator.
 pub fn detect_avatar_entities(cmd: &GameCommand) -> Vec<AvatarEntity> {
-    if cmd.command_id != 27685 {
+    if cmd.proto_data.len() < 8 || cmd.proto_data.len() > 131_072 {
         return Vec::new();
     }
     let mut out = Vec::new();
@@ -518,14 +529,14 @@ pub fn detect_avatar_entities(cmd: &GameCommand) -> Vec<AvatarEntity> {
     out
 }
 
-/// Gadget spawns from SceneEntityAppearNotify (27685):
+/// Gadget spawns from SceneEntityAppearNotify-shaped payloads:
 /// `{8: [SceneEntityInfo]}` where gadget entities are
 /// `{1: type=4, 2: entity_id, 4: motion{1: pos{1,2,3}},
 ///   13: gadget{1: gadget_id, 3: config_id}}`.
 /// Builds the registry that turns GadgetInteractRsp entity ids into
-/// exact world positions.
+/// exact world positions. Command-id agnostic (was 27685 pre-7.2).
 pub fn detect_gadget_spawns(cmd: &GameCommand) -> Vec<GadgetSpawn> {
-    if cmd.command_id != 27685 {
+    if cmd.proto_data.len() < 8 || cmd.proto_data.len() > 131_072 {
         return Vec::new();
     }
     let mut out = Vec::new();
@@ -658,8 +669,13 @@ pub struct GadgetInteract {
     pub interact_type: u64,
 }
 
+/// GadgetInteractRsp-shaped payloads: server-confirmed interaction with
+/// a gadget — `{3: gadget_id, 11: interact_type, 15: gadget_entity_id}`.
+/// InteractType 3 = OPEN_CHEST, 8 = GENERAL_REWARD (chest family).
+/// Command-id agnostic (was 881 pre-7.2): small payloads whose field
+/// triple passes sanity ranges — entity id required.
 pub fn detect_gadget_interact(cmd: &GameCommand) -> Option<GadgetInteract> {
-    if cmd.command_id != 881 {
+    if cmd.proto_data.len() > 96 {
         return None;
     }
     let fields = parse(&cmd.proto_data)?;
@@ -674,31 +690,86 @@ pub fn detect_gadget_interact(cmd: &GameCommand) -> Option<GadgetInteract> {
             _ => {}
         }
     }
+    let entity_id = entity_id?;
+    if entity_id == 0 || entity_id > 100_000_000 {
+        return None;
+    }
+    let gadget_id = gadget_id.unwrap_or(0);
+    if gadget_id > 100_000_000 {
+        return None;
+    }
+    let interact_type = interact_type.unwrap_or(0);
+    if interact_type > 32 {
+        return None;
+    }
+    // At least one of gadget_id / interact_type must be present besides
+    // the entity id, or this is just some other message with a varint 15.
+    if gadget_id == 0 && interact_type == 0 {
+        return None;
+    }
     Some(GadgetInteract {
-        entity_id: entity_id?,
-        gadget_id: gadget_id.unwrap_or(0),
-        interact_type: interact_type.unwrap_or(0),
+        entity_id,
+        gadget_id,
+        interact_type,
     })
 }
 
-/// Scene-entry (cmd 9582 = PlayerEnterSceneNotify): `{9: scene_id,
+/// Scene-entry (PlayerEnterSceneNotify-shaped): `{9: scene_id,
 /// 6: prev_scene_id, …}`. Every separate region has its own scene id —
 /// this is the authoritative "which world am I in" signal:
 /// Teyvat 4294906403, Chasm mines 4294906400, moon 4294906496
 /// (observed in 7.1 captures). Returns (scene_id, prev_scene_id).
+/// Command-id agnostic (was 9582 pre-7.2): the big scene-id family
+/// (4294xxxxxxx) is the discriminator — plain `{9: varint}` messages
+/// with unrelated values must not fire.
 pub fn detect_scene_enter(buf: &[u8]) -> Option<(u64, u64)> {
+    if buf.len() > 256 {
+        return None;
+    }
     let fields = parse(buf)?;
     let scene = fields
         .iter()
         .find(|(f, _)| *f == 9)?
         .1
         .as_varint()?;
+    if !(4_294_000_000..=4_294_967_295).contains(&scene) {
+        return None;
+    }
     let prev = fields
         .iter()
         .find(|(f, _)| *f == 6)
         .and_then(|(_, v)| v.as_varint())
         .unwrap_or(0);
     Some((scene, prev))
+}
+
+/// WorldChestOpenNotify-shaped payload: `{2: scene_id (big family),
+/// 11: config_id, 12: group_id}` — the dedicated chest-open broadcast
+/// (was cmd 28616 pre-7.2). No position (the player stands at the
+/// chest), no ActionReason dependency.
+pub fn detect_world_chest(buf: &[u8]) -> Option<(u64, u64)> {
+    if buf.is_empty() || buf.len() > 128 {
+        return None;
+    }
+    let fields = parse(buf)?;
+    let scene = fields
+        .iter()
+        .find(|(f, _)| *f == 2)?
+        .1
+        .as_varint()?;
+    if !(4_294_000_000..=4_294_967_295).contains(&scene) {
+        return None;
+    }
+    let config = fields
+        .iter()
+        .find(|(f, _)| *f == 11)
+        .and_then(|(_, v)| v.as_varint())?;
+    let group = fields
+        .iter()
+        .find(|(f, _)| *f == 12)
+        .and_then(|(_, v)| v.as_varint())
+        .unwrap_or(0);
+    Some((config, group))
 }
 
 /// Map-layer entry (cmd 5991 = _EnterMapLayerReq): `{4: map_layer_id}` —

@@ -361,6 +361,18 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
         let mut region_feature_at: Option<(String, std::time::Instant)> = None;
         let mut active_region: Option<u32> = None;
         let mut first_position_at: Option<std::time::Instant> = None;
+        // Command ids rotate EVERY major version (7.2 renumbered the
+        // whole space). Detectors are shape-based and cmd-agnostic; this
+        // logs the carrier id once per family per session so the current
+        // mapping is always discoverable from app.log.
+        let mut carriers: std::collections::HashSet<(&'static str, u16)> =
+            std::collections::HashSet::new();
+        // Map-layer carrier learning: `{4: layer_id}` (or empty = default
+        // layer) fires from many unrelated cmds, so only KNOWN layer ids
+        // are accepted from any cmd; an empty payload counts as "default
+        // layer" only from the cmd that most recently carried a known id.
+        let known_layer_ids = crate::mapwin::MapWindow::known_layer_ids();
+        let mut layer_carrier_cmd: Option<u16> = None;
         // Scene-id tracking (9582 PlayerEnterSceneNotify) — the
         // authoritative "which world am I in" signal. Separate regions
         // (Chasm, moon, Enkanomiya, …) each have their own scene and
@@ -558,21 +570,47 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                             last_big_packet = Some(std::time::Instant::now());
                         }
 
-                        // _EnterMapLayerReq/Rsp (5991/21115): the client
-                        // reports the map layer the minimap switched to
-                        // when crossing a world-area boundary. The Req
-                        // payload is `{4: map_layer_id}` (empty = default
-                        // layer) — the definitive floor signal. The Rsp
-                        // is a bare retcode and carries nothing.
-                        if command.command_id == 5991 {
+                        // _EnterMapLayerReq/Rsp shape: the client reports
+                        // the map layer the minimap switched to when
+                        // crossing a world-area boundary. The payload is
+                        // `{4: map_layer_id}` (empty = default layer) —
+                        // the definitive floor signal. Cmd ids rotate
+                        // (was 5991); accept the shape from any command,
+                        // gated on KNOWN layer ids, with empty payloads
+                        // honored only from the learned carrier cmd.
+                        if command.proto_data.len() <= 8 {
                             if let Some(layer_id) =
                                 explore::detect_map_layer(&command.proto_data)
                             {
-                                tracing::debug!(
-                                    "map layer → {layer_id:?}"
-                                );
-                                let _ =
-                                    tx.send(Msg::MapLayer { layer_id });
+                                let accept = match layer_id {
+                                    Some(id) => {
+                                        known_layer_ids.contains(&id)
+                                    }
+                                    None => {
+                                        layer_carrier_cmd
+                                            == Some(command.command_id)
+                                    }
+                                };
+                                if accept {
+                                    if layer_id.is_some() {
+                                        layer_carrier_cmd =
+                                            Some(command.command_id);
+                                    }
+                                    if carriers.insert((
+                                        "map-layer",
+                                        command.command_id,
+                                    )) {
+                                        tracing::info!(
+                                            cmd = command.command_id,
+                                            "carrier identified: map-layer"
+                                        );
+                                    }
+                                    tracing::debug!(
+                                        "map layer → {layer_id:?}"
+                                    );
+                                    let _ =
+                                        tx.send(Msg::MapLayer { layer_id });
+                                }
                             }
                         }
 
@@ -585,17 +623,28 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                             );
                         }
 
-                        // Scene entry (9582): the authoritative world
-                        // discriminator — each separate region has its
-                        // own scene id and local coordinates. Known ids
-                        // drive the map directly; unknown ones are
-                        // logged once so they can be mapped later.
-                        if command.command_id == 9582 {
+                        // Scene entry (PlayerEnterSceneNotify shape): the
+                        // authoritative world discriminator — each separate
+                        // region has its own scene id and local
+                        // coordinates. Cmd ids rotate (was 9582); the
+                        // big scene-id family is the shape discriminator.
+                        // Known ids drive the map directly; unknown ones
+                        // are logged once so they can be mapped later.
+                        {
                             if let Some((scene, prev)) =
                                 explore::detect_scene_enter(
                                     &command.proto_data,
                                 )
                             {
+                                if carriers.insert((
+                                    "scene-enter",
+                                    command.command_id,
+                                )) {
+                                    tracing::info!(
+                                        cmd = command.command_id,
+                                        "carrier identified: scene-enter"
+                                    );
+                                }
                                 tracing::debug!(
                                     scene,
                                     prev,
@@ -953,14 +1002,25 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                             }
                         }
 
-                        // WorldChestOpenNotify (28616): the dedicated
-                        // chest-open broadcast `{2: scene_id, 11:
-                        // config_id, 12: group_id}` — no position (the
-                        // player stands at the chest), no ActionReason
-                        // dependency. Arms a pending mark; the ItemAdd
-                        // path (which knows the Mora amount) normally
-                        // resolves it within milliseconds.
-                        if command.command_id == 28616 {
+                        // WorldChestOpenNotify shape (`{2: scene_id,
+                        // 11: config_id, 12: group_id}` — cmd ids rotate,
+                        // was 28616): the dedicated chest-open broadcast
+                        // — no position (the player stands at the chest),
+                        // no ActionReason dependency. Arms a pending mark;
+                        // the ItemAdd path (which knows the Mora amount)
+                        // normally resolves it within milliseconds.
+                        if explore::detect_world_chest(&command.proto_data)
+                            .is_some()
+                        {
+                            if carriers.insert((
+                                "world-chest",
+                                command.command_id,
+                            )) {
+                                tracing::info!(
+                                    cmd = command.command_id,
+                                    "carrier identified: world-chest"
+                                );
+                            }
                             if last_chest_send
                                 .map(|t| {
                                     t.elapsed()
@@ -1122,6 +1182,15 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                         // Player position: direct carrier (ground truth, ~every 6s)
                         // + batch carrier filtered by learned entity_id (~1Hz).
                         if let Some(motion) = explore::detect_player_position(command) {
+                            if carriers.insert((
+                                "direct-pos",
+                                command.command_id,
+                            )) {
+                                tracing::info!(
+                                    cmd = command.command_id,
+                                    "carrier identified: direct-pos"
+                                );
+                            }
                             if pos_tracker.accept(motion.x, motion.y, motion.z) {
                                 let (px, py, pz) = pos_tracker.last.unwrap();
                                 last_position_at = Some(std::time::Instant::now());
@@ -1254,6 +1323,15 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                         // new entity ids) triggers re-learning.
                         let entries = explore::detect_batch_entries(command);
                         if !entries.is_empty() {
+                            if carriers.insert((
+                                "batch-move",
+                                command.command_id,
+                            )) {
+                                tracing::info!(
+                                    cmd = command.command_id,
+                                    "carrier identified: batch-move"
+                                );
+                            }
                             match player_entity_id {
                                 Some(pid)
                                     if !entries
@@ -1368,6 +1446,15 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                         // Gadget spawns → registry for interact
                         // position resolution.
                         for spawn in explore::detect_gadget_spawns(command) {
+                            if carriers.insert((
+                                "gadget-spawn",
+                                command.command_id,
+                            )) {
+                                tracing::info!(
+                                    cmd = command.command_id,
+                                    "carrier identified: gadget-spawn"
+                                );
+                            }
                             gadget_registry.insert(
                                 spawn.entity_id,
                                 (
@@ -1386,6 +1473,15 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                         // mis-learned batch entity (NPC latches
                         // self-heal the moment an avatar appears).
                         for av in explore::detect_avatar_entities(command) {
+                            if carriers.insert((
+                                "avatar-appear",
+                                command.command_id,
+                            )) {
+                                tracing::info!(
+                                    cmd = command.command_id,
+                                    "carrier identified: avatar-appear"
+                                );
+                            }
                             if Some(av.uid as u64)
                                 == detected_uid.map(|u| u as u64)
                             {
@@ -1423,6 +1519,15 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                         if let Some(inter) =
                             explore::detect_gadget_interact(command)
                         {
+                            if carriers.insert((
+                                "gadget-interact",
+                                command.command_id,
+                            )) {
+                                tracing::info!(
+                                    cmd = command.command_id,
+                                    "carrier identified: gadget-interact"
+                                );
+                            }
                             // Duplicate suppression: the same entity's
                             // Rsp retriggering within 2s (retransmit or
                             // overlap) must not re-mark.
