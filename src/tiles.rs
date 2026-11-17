@@ -6,7 +6,7 @@
 //! decoded textures to the UI thread with an LRU byte budget.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
@@ -59,6 +59,36 @@ pub fn tile_url(map_id: u32, version: &str, x: u32, y: u32, zoom: i32) -> String
     format!("{TILE_BASE}{map_id}/{version}/{x}_{y}_{ztag}.png")
 }
 
+/// Stable 64-bit FNV-1a hash of a `map_version` string. HoYoLab bumps the
+/// version whenever map imagery changes; embedding its hash in tile cache
+/// filenames means stale tiles from an old patch can never shadow fresh
+/// ones (the URL path changes, and so does the disk path).
+pub fn version_hash(v: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in v.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Disk path for a tile of a SPECIFIC map version — shared by the
+/// overview pre-stitch (map.rs) and the on-demand store so both layers
+/// read/write the same version-keyed files.
+pub fn tile_cache_path(
+    cache_dir: &Path,
+    map_id: u32,
+    version: &str,
+    zoom: i32,
+    x: u32,
+    y: u32,
+) -> PathBuf {
+    cache_dir.join(format!(
+        "tilev2_{map_id}_v{:x}_{zoom}_{x}_{y}.png",
+        version_hash(version)
+    ))
+}
+
 /// Grid dimensions for a zoom level.
 pub fn grid_for(total: (f64, f64), zoom: i32) -> (u32, u32) {
     let f = 2f64.powi(zoom);
@@ -72,6 +102,8 @@ pub struct TileStore {
     cache_dir: PathBuf,
     shared: Arc<Shared>,
     textures: HashMap<TileKey, (egui::TextureHandle, u64)>,
+    /// Current version hash per map; a change evicts that map's textures.
+    map_versions: HashMap<u32, u64>,
     frame: u64,
     bytes: usize,
     budget: usize,
@@ -97,6 +129,7 @@ impl TileStore {
             cache_dir,
             shared,
             textures: HashMap::new(),
+            map_versions: HashMap::new(),
             frame: 0,
             bytes: 0,
             budget: 384 * 1024 * 1024, // ~1500 tiles of 256 KB
@@ -166,7 +199,9 @@ impl TileStore {
     }
 
     fn tile_path(&self, (map_id, zoom, x, y): TileKey) -> PathBuf {
-        self.cache_dir.join(format!("tilev2_{map_id}_{zoom}_{x}_{y}.png"))
+        let vh = self.map_versions.get(&map_id).copied().unwrap_or(0);
+        self.cache_dir
+            .join(format!("tilev2_{map_id}_v{vh:x}_{zoom}_{x}_{y}.png"))
     }
 
     /// Fetch (or schedule) a tile; returns its texture if resident.
@@ -178,6 +213,24 @@ impl TileStore {
         x: u32,
         y: u32,
     ) -> Option<egui::TextureId> {
+        // A version bump invalidates everything cached for that map —
+        // both the disk files (purged by map.rs) and resident textures.
+        let vh = version_hash(version);
+        if self.map_versions.get(&map_id) != Some(&vh) {
+            self.map_versions.insert(map_id, vh);
+            let stale: Vec<TileKey> = self
+                .textures
+                .keys()
+                .filter(|(m, ..)| *m == map_id)
+                .cloned()
+                .collect();
+            for key in stale {
+                if let Some((tex, _)) = self.textures.remove(&key) {
+                    let s = tex.size_vec2();
+                    self.bytes -= s.x as usize * s.y as usize * 4;
+                }
+            }
+        }
         let key: TileKey = (map_id, zoom, x, y);
         if let Some((tex, last)) = self.textures.get_mut(&key) {
             *last = self.frame;

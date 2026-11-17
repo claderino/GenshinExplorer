@@ -7,10 +7,11 @@
 //!    (chest opens, oculus collects, challenge completions)
 
 use std::collections::HashMap;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
+
+use crate::map::fetch_json;
 use eframe::egui;
 
 const PIN_API: &str =
@@ -196,18 +197,9 @@ impl PinIndex {
 pub fn load_pin_data(map_id: u32, cache_dir: &Path) -> Result<PinData> {
     std::fs::create_dir_all(cache_dir)?;
     let cache = cache_dir.join(format!("pins_v3_{}.json", map_id));
-    let body = if cache.exists() {
-        std::fs::read_to_string(&cache)?
-    } else {
-        let url = format!("{}?map_id={}&app_sn=ys_obc&lang=en-us", PIN_API, map_id);
-        let agent = ureq::AgentBuilder::new().user_agent("Mozilla/5.0").build();
-        let mut reader = agent.get(&url).call().context("downloading pins")?.into_reader();
-        let mut buf = String::new();
-        reader.read_to_string(&mut buf)?;
-        std::fs::write(&cache, &buf)?;
-        buf
-    };
-
+    let url = format!("{}?map_id={}&app_sn=ys_obc&lang=en-us", PIN_API, map_id);
+    // Fresh fetch (new-patch pins arrive here); cache is offline fallback.
+    let body = fetch_json(&url, &cache).context("downloading pins (network + cache)")?;
     let json: serde_json::Value = serde_json::from_str(&body)?;
     parse(&json, map_id, cache_dir)
 }
@@ -384,49 +376,26 @@ fn collect_group_ids(
     }
 }
 
-/// Label tree: `data.tree[] = {id, name, children…}` — cached per map.
+/// Label tree: `data.tree[] = {id, name, children…}` — fetched fresh,
+/// cached for offline.
 fn load_label_tree(map_id: u32, cache_dir: &Path) -> Option<Vec<serde_json::Value>> {
     let cache = cache_dir.join(format!("label_tree_v2_{}.json", map_id));
-    let body = if cache.exists() {
-        std::fs::read_to_string(&cache).ok()?
-    } else {
-        let url = format!("{LABEL_TREE_API}?app_sn=ys_obc&lang=en-us&map_id={map_id}");
-        let agent = ureq::AgentBuilder::new().user_agent("Mozilla/5.0").build();
-        let mut reader = agent.get(&url).call().ok()?.into_reader();
-        let mut buf = String::new();
-        reader.read_to_string(&mut buf).ok()?;
-        std::fs::write(&cache, &buf).ok()?;
-        buf
-    };
+    let url = format!("{LABEL_TREE_API}?app_sn=ys_obc&lang=en-us&map_id={map_id}");
+    let body = fetch_json(&url, &cache)?;
     let json: serde_json::Value = serde_json::from_str(&body).ok()?;
     json.pointer("/data/tree")
         .and_then(|v| v.as_array())
         .cloned()
 }
 
-/// Point groups (layered floors) per map — cached.
+/// Point groups (layered floors) per map — fetched fresh, cached offline.
 fn load_point_groups(map_id: u32, cache_dir: &Path) -> Vec<FloorInfo> {
     let cache = cache_dir.join(format!("point_groups_{map_id}.json"));
-    let body = if cache.exists() {
-        std::fs::read_to_string(&cache).ok()
-    } else {
-        let fetched = (|| -> Option<String> {
-            let url = format!(
-                "https://sg-public-api-static.hoyolab.com/common/map_user/ys_obc\
-                 /v2/map/point_group?map_id={map_id}&app_sn=ys_obc&lang=en-us"
-            );
-            let agent =
-                ureq::AgentBuilder::new().user_agent("Mozilla/5.0").build();
-            let mut reader =
-                agent.get(&url).call().ok()?.into_reader();
-            let mut buf = String::new();
-            reader.read_to_string(&mut buf).ok()?;
-            std::fs::write(&cache, &buf).ok()?;
-            Some(buf)
-        })();
-        fetched
-    };
-    let Some(body) = body else { return Vec::new() };
+    let url = format!(
+        "https://sg-public-api-static.hoyolab.com/common/map_user/ys_obc\
+         /v2/map/point_group?map_id={map_id}&app_sn=ys_obc&lang=en-us"
+    );
+    let Some(body) = fetch_json(&url, &cache) else { return Vec::new() };
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
         return Vec::new();
     };
@@ -497,17 +466,8 @@ fn load_point_groups(map_id: u32, cache_dir: &Path) -> Vec<FloorInfo> {
 
 fn load_map_info(map_id: u32, cache_dir: &Path) -> Option<MapInfo> {
     let cache = cache_dir.join(format!("info_v3_{}.json", map_id));
-    let body = if cache.exists() {
-        std::fs::read_to_string(&cache).ok()?
-    } else {
-        let url = format!("{}?map_id={}&app_sn=ys_obc&lang=en-us", MAP_INFO_API, map_id);
-        let agent = ureq::AgentBuilder::new().user_agent("Mozilla/5.0").build();
-        let mut reader = agent.get(&url).call().ok()?.into_reader();
-        let mut buf = String::new();
-        reader.read_to_string(&mut buf).ok()?;
-        std::fs::write(&cache, &buf).ok()?;
-        buf
-    };
+    let url = format!("{}?map_id={}&app_sn=ys_obc&lang=en-us", MAP_INFO_API, map_id);
+    let body = fetch_json(&url, &cache)?;
     let json: serde_json::Value = serde_json::from_str(&body).ok()?;
     MapInfo::from_info_body(&json, map_id)
 }

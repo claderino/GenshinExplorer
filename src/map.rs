@@ -62,6 +62,50 @@ fn http_agent() -> ureq::Agent {
         .build()
 }
 
+/// Fetch a map API body FRESH, falling back to the disk cache only when
+/// the network fails. HoYoLab bumps `map_version`, map extents and pin
+/// lists with every patch — the disk copy is an offline fallback, never
+/// the primary (with cache-first semantics a 7.x region expansion would
+/// never appear until the cache file was deleted by hand).
+pub fn fetch_json(url: &str, cache: &Path) -> Option<String> {
+    if let Ok(resp) = http_agent().get(url).call() {
+        let mut buf = String::new();
+        if std::io::Read::read_to_string(&mut resp.into_reader(), &mut buf).is_ok() {
+            // Sanity: only accept a well-formed body with a `data` node,
+            // so a 200-with-error-response never poisons the cache.
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&buf) {
+                if v.pointer("/data").is_some_and(|d| !d.is_null()) {
+                    let _ = std::fs::write(cache, &buf);
+                    return Some(buf);
+                }
+            }
+        }
+    }
+    tracing::info!("{url} unreachable — serving cached copy");
+    std::fs::read_to_string(cache).ok()
+}
+
+/// Drop tiles from other map versions (and legacy pre-versioning files)
+/// so a patch bump re-downloads cleanly instead of mixing old and new
+/// imagery. Tile filenames embed the version hash (see `tiles`).
+fn purge_stale_tiles(cache_dir: &Path, map_id: u32, version: &str) {
+    let prefix = format!("tilev2_{map_id}_");
+    let keep = format!("{prefix}v{:x}", tiles::version_hash(version));
+    let Ok(rd) = std::fs::read_dir(cache_dir) else { return };
+    let mut removed = 0usize;
+    for entry in rd.flatten() {
+        let Some(name) = entry.file_name().into_string().ok() else { continue };
+        if name.starts_with(&prefix) && !name.starts_with(&keep) {
+            if std::fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    if removed > 0 {
+        tracing::info!(map_id, removed, "removed tiles from old map versions");
+    }
+}
+
 fn arr2(v: &serde_json::Value, key: &'static str) -> Result<(f64, f64)> {
     let a = v.get(key).and_then(|v| v.as_array()).context(key)?;
     Ok((a[0].as_f64().context("x")?, a[1].as_f64().context("y")?))
@@ -76,19 +120,14 @@ pub fn ensure_map(
 ) -> Result<MapData> {
     std::fs::create_dir_all(cache_dir)?;
 
-    // 1. Map info (full API body, shared with pins.rs).
+    // 1. Map info (full API body, shared with pins.rs) — always fetched
+    //    fresh so patch-day extent/version changes are picked up; the
+    //    cached file only serves offline starts.
     let info_path = cache_dir.join(format!("info_v3_{map_id}.json"));
-    let info: serde_json::Value = if info_path.exists() {
-        serde_json::from_str(&std::fs::read_to_string(&info_path)?)?
-    } else {
-        let url = format!("{MAP_INFO_API}?map_id={map_id}&app_sn=ys_obc&lang=en-us");
-        let mut reader = http_agent().get(&url).call().context("fetching map info")?.into_reader();
-        let mut buf = String::new();
-        std::io::Read::read_to_string(&mut reader, &mut buf)?;
-        let body: serde_json::Value = serde_json::from_str(&buf)?;
-        std::fs::write(&info_path, body.to_string())?;
-        body
-    };
+    let info_url = format!("{MAP_INFO_API}?map_id={map_id}&app_sn=ys_obc&lang=en-us");
+    let body =
+        fetch_json(&info_url, &info_path).context("fetching map info (network + cache)")?;
+    let info: serde_json::Value = serde_json::from_str(&body)?;
 
     let name = info.pointer("/data/info/name")
         .and_then(|v| v.as_str()).unwrap_or("Map").to_string();
@@ -104,6 +143,9 @@ pub fn ensure_map(
         .context("map_version")?.to_string();
     let min_zoom = v2.get("min_zoom").and_then(|v| v.as_i64()).unwrap_or(-4) as i32;
     let max_zoom = v2.get("max_zoom").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+
+    // Invalidate tiles from other map versions before downloading.
+    purge_stale_tiles(cache_dir, map_id, &version);
 
     // 2. Overview backdrop: lowest zoom that fits the tile budget.
     let mut zoom = min_zoom;
@@ -123,7 +165,7 @@ pub fn ensure_map(
     let mut done = 0usize;
     for y in 0..rows {
         for x in 0..cols {
-            let path = cache_dir.join(format!("tilev2_{map_id}_{zoom}_{x}_{y}.png"));
+            let path = tiles::tile_cache_path(cache_dir, map_id, &version, zoom, x, y);
             if !path.exists() {
                 let url = format!("{}{map_id}/{version}/{x}_{y}_{ztag}.png", tiles::TILE_BASE);
                 let mut reader = http_agent().get(&url).call()

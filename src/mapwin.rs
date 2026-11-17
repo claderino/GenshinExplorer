@@ -396,6 +396,10 @@ pub struct MapWindow {
     floor_overlays: HashMap<u32, egui::TextureHandle>,
     /// Solved per-axis scale override (from ≥2 calibration points).
     cal_scale: Option<(f64, f64)>,
+    /// Origin the loaded calibration was solved against (from the file's
+    /// `origin` field). When HoYoLab shifts the map origin in a patch,
+    /// the calibration is migrated by the delta at map-load time.
+    cal_file_origin: Option<(f64, f64)>,
     /// Transient toast notes ("✓ Exquisite Chest auto-collected").
     auto_notes: Vec<(String, std::time::Instant)>,
 }
@@ -422,7 +426,7 @@ mod defaults {
 impl MapWindow {
     pub fn new() -> Self {
         let selected_map = 2;
-        let (cal_off, cal_scale, cal_points, cal_frame_floors) =
+        let (cal_off, cal_scale, cal_points, cal_frame_floors, cal_file_origin) =
             Self::load_calibration(selected_map);
         Self {
             state: MapLoadState::Idle, open: true,
@@ -430,6 +434,7 @@ impl MapWindow {
             calibrate_offset: cal_off, calibrating: false,
             cal_points,
             cal_frame_floors,
+            cal_file_origin,
             active_cal_frame: 0,
             active_floor: None,
             floor_locked: false,
@@ -785,6 +790,7 @@ impl MapWindow {
             Option<(f64, f64)>,
             Vec<Vec<CalPoint>>,
             Vec<Option<(u32, u32)>>,
+            Option<(f64, f64)>,
         )
     {
         // User file first; embedded default when absent (a deliberately
@@ -797,11 +803,11 @@ impl MapWindow {
             (Ok(t), _) => t,
             (Err(_), Some(d)) => d,
             (Err(_), None) => {
-                return (None, None, Vec::new(), Vec::new())
+                return (None, None, Vec::new(), Vec::new(), None)
             }
         };
         let Ok(j) = serde_json::from_str::<serde_json::Value>(text) else {
-            return (None, None, Vec::new(), Vec::new());
+            return (None, None, Vec::new(), Vec::new(), None);
         };
         let g = |k: &str| j.get(k).and_then(|v| v.as_f64());
         let offset = match (g("offset_x"), g("offset_y")) {
@@ -810,6 +816,12 @@ impl MapWindow {
         };
         let scale = match (g("scale_x"), g("scale_y")) {
             (Some(x), Some(y)) if x > 0.05 && y > 0.05 => Some((x, y)),
+            _ => None,
+        };
+        // Origin the calibration was solved against (absent in legacy
+        // files written before patch-migration existed).
+        let file_origin = match (g("origin_x"), g("origin_y")) {
+            (Some(x), Some(y)) => Some((x, y)),
             _ => None,
         };
         let parse_point = |p: &serde_json::Value| -> Option<CalPoint> {
@@ -865,14 +877,16 @@ impl MapWindow {
                 }
             }
         }
-        (offset, scale, frames, frame_floors)
+        (offset, scale, frames, frame_floors, file_origin)
     }
+    #[allow(clippy::too_many_arguments)]
     fn save_calibration(
         map_id: u32,
         offset: Option<(f64, f64)>,
         scale: Option<(f64, f64)>,
         frames: &[Vec<CalPoint>],
         frame_floors: &[Option<(u32, u32)>],
+        origin: Option<(f64, f64)>,
     ) {
         if let Some(p) = Self::calibration_path(map_id) {
             let mut v = serde_json::json!({});
@@ -883,6 +897,12 @@ impl MapWindow {
             if let Some((x, y)) = scale {
                 v["scale_x"] = x.into();
                 v["scale_y"] = y.into();
+            }
+            // Stamp the map origin this solve is valid for, so a later
+            // patch that shifts the origin can auto-migrate the file.
+            if let Some((x, y)) = origin {
+                v["origin_x"] = x.into();
+                v["origin_y"] = y.into();
             }
             let floors_json: Vec<_> = (0..frames.len())
                 .map(|i| match frame_floors.get(i) {
@@ -1126,8 +1146,53 @@ impl MapWindow {
                     ui.add(egui::ProgressBar::new(d as f32 / t as f32).show_percentage());
                     if let Some(r) = result.lock().unwrap().take() {
                         match r {
-                            Ok(data) => next_state =
-                                Some(MapLoadState::Ready{texture:None,data:Arc::new(data)}),
+                            Ok(data) => {
+                                // HoYoLab shifts the map origin when a
+                                // patch extends a region (7.2 moved map 2
+                                // by ~7,500 px). A calibration solved
+                                // against the old origin is migrated by
+                                // the delta; transform is
+                                // (origin − world)·scale + offset, so the
+                                // offset shifts by −Δ·scale and stored
+                                // points move by +Δ (raw-frame shift).
+                                if let Some((fx, fy)) = self.cal_file_origin {
+                                    let (dx, dy) =
+                                        (data.origin.0 - fx, data.origin.1 - fy);
+                                    if dx.abs() > 1e-9 || dy.abs() > 1e-9 {
+                                        let (sx, sy) = self.cal_scale
+                                            .unwrap_or((data.world_scale, data.world_scale));
+                                        let (ox, oy) =
+                                            self.calibrate_offset.unwrap_or((0.0, 0.0));
+                                        self.calibrate_offset =
+                                            Some((ox - dx * sx, oy - dy * sy));
+                                        for frame in &mut self.cal_points {
+                                            for p in frame.iter_mut() {
+                                                p.mx += dx;
+                                                p.my += dy;
+                                            }
+                                        }
+                                        Self::save_calibration(
+                                            data.map_id, self.calibrate_offset,
+                                            self.cal_scale, &self.cal_points,
+                                            &self.cal_frame_floors,
+                                            Some(data.origin),
+                                        );
+                                        self.cal_file_origin = Some(data.origin);
+                                        tracing::info!(
+                                            map_id = data.map_id, dx, dy,
+                                            "map origin shifted — calibration migrated"
+                                        );
+                                    }
+                                } else if self.calibrate_offset.is_some() {
+                                    tracing::info!(
+                                        map_id = data.map_id,
+                                        "calibration predates origin tracking — \
+                                         re-solve once to enable auto-migration"
+                                    );
+                                }
+                                next_state =
+                                    Some(MapLoadState::Ready{texture:None,data:Arc::new(data)})
+                            }
                             Err(e) => {
                                 ui.colored_label(egui::Color32::RED, format!("{e:#}"));
                                 next_state = Some(MapLoadState::Idle);
@@ -2976,10 +3041,12 @@ impl MapWindow {
                                     self.cal_scale = Some((xf2.sx, xf2.sy));
                                     self.calibrate_offset =
                                         Some((xf2.ox, xf2.oy));
+                                    self.cal_file_origin = Some(md.origin);
                                     Self::save_calibration(
                                         md.map_id, self.calibrate_offset,
                                         self.cal_scale, &self.cal_points,
                                         &self.cal_frame_floors,
+                                        Some(md.origin),
                                     );
                                     let n = self.cal_points[frame_idx].len();
                                     let frames = self.cal_points.len();
@@ -3003,8 +3070,9 @@ impl MapWindow {
                                 self.active_cal_frame = 0;
                                 self.cal_scale = None;
                                 self.calibrate_offset = None;
+                                self.cal_file_origin = None;
                                 Self::save_calibration(
-                                    md.map_id, None, None, &[], &[],
+                                    md.map_id, None, None, &[], &[], None,
                                 );
                                 self.auto_notes.push((
                                     "📍 calibration cleared".into(),
@@ -3136,12 +3204,13 @@ impl MapWindow {
                 self.pin_match_retired = false;    // fresh bootstrap per map
                 self.floor_locked = false;         // surface locks don't carry over
                 self.floor_overlays.clear();
-                let (off, scale, pts, frame_floors) =
+                let (off, scale, pts, frame_floors, file_origin) =
                     Self::load_calibration(id);
                 self.calibrate_offset = off;
                 self.cal_scale = scale;
                 self.cal_points = pts;
                 self.cal_frame_floors = frame_floors;
+                self.cal_file_origin = file_origin;
                 self.pan = egui::Vec2::ZERO; self.view_init = false; self.follow = true;
                 self.start_pin_load();
                 self.start_map_download(cache_dir);
