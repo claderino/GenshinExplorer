@@ -128,53 +128,86 @@ pub fn region_display(region: &str) -> &'static str {
     }
 }
 
-/// List the Genshin characters bound to a session, one per region
-/// (`getUserGameRolesByLtoken`). Silent per-region failures → fewer roles.
+/// List the Genshin characters bound to a session across ALL regions
+/// (`getUserGameRolesByLtoken`). One unfiltered call returns every bound
+/// role with its own `region` field — the previous four rapid per-region
+/// calls tripped the endpoint's rate limiter and silently dropped a
+/// region (observed: EU missing from 🧲 Auto). Per-region queries with
+/// spacing remain as the fallback.
 pub fn fetch_game_roles(cookie: &str) -> Vec<GameRole> {
     let agent = ureq::AgentBuilder::new()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
         .build();
+    let base = "https://sg-public-api.hoyolab.com/binding/api/getUserGameRolesByLtoken?game_biz=hk4e_global";
+
+    if let Some(roles) = fetch_roles_once(&agent, base, cookie, None) {
+        if !roles.is_empty() {
+            return roles;
+        }
+    }
+
+    // Fallback: per-region queries, spaced, one retry each.
     let mut roles = Vec::new();
     for region in ["os_usa", "os_eu", "os_asia", "os_cht"] {
-        let url = format!(
-            "https://sg-public-api.hoyolab.com/binding/api/getUserGameRolesByLtoken\
-             ?game_biz=hk4e_global&region={region}"
-        );
-        let Ok(resp) = agent
-            .get(&url)
-            .set("Cookie", cookie.trim())
-            .set("x-rpc-language", "en")
-            .set("Referer", "https://act.hoyolab.com/")
-            .call()
-        else {
-            continue;
-        };
-        let mut body = String::new();
-        if resp.into_reader().read_to_string(&mut body).is_err() {
-            continue;
-        }
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
-            continue;
-        };
-        let Some(list) = json.pointer("/data/list").and_then(|v| v.as_array()) else {
-            continue;
-        };
-        for it in list {
-            let (Some(uid), Some(nick)) = (
-                it.get("game_uid").and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<u32>().ok()),
-                it.get("nickname").and_then(|v| v.as_str()),
-            ) else {
-                continue;
-            };
-            roles.push(GameRole {
-                uid,
-                region: region.to_string(),
-                nickname: nick.to_string(),
-            });
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let url = format!("{base}&region={region}");
+        for _ in 0..2 {
+            match fetch_roles_once(&agent, &url, cookie, Some(region)) {
+                Some(r) => {
+                    roles.extend(r);
+                    break;
+                }
+                None => {
+                    std::thread::sleep(std::time::Duration::from_millis(700));
+                }
+            }
         }
     }
     roles
+}
+
+/// One roles query; `None` on any transport/format failure. When
+/// `region_override` is None the region is read from each item (the
+/// unfiltered response labels every role with its own region).
+fn fetch_roles_once(
+    agent: &ureq::Agent,
+    url: &str,
+    cookie: &str,
+    region_override: Option<&str>,
+) -> Option<Vec<GameRole>> {
+    let resp = agent
+        .get(url)
+        .set("Cookie", cookie.trim())
+        .set("x-rpc-language", "en")
+        .set("Referer", "https://act.hoyolab.com/")
+        .call()
+        .ok()?;
+    let mut body = String::new();
+    resp.into_reader().read_to_string(&mut body).ok()?;
+    let json = serde_json::from_str::<serde_json::Value>(&body).ok()?;
+    let list = json.pointer("/data/list").and_then(|v| v.as_array())?;
+    let mut roles = Vec::new();
+    for it in list {
+        let (Some(uid), Some(nick)) = (
+            it.get("game_uid").and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u32>().ok()),
+            it.get("nickname").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let region = region_override
+            .map(|r| r.to_string())
+            .or_else(|| {
+                it.get("region").and_then(|v| v.as_str()).map(String::from)
+            })
+            .unwrap_or_else(|| "os_usa".into());
+        roles.push(GameRole {
+            uid,
+            region,
+            nickname: nick.to_string(),
+        });
+    }
+    Some(roles)
 }
 
 /// Mark one point on HoYoLab.
