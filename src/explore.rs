@@ -469,12 +469,12 @@ pub struct AvatarEntity {
     pub avatar_id: u32,
 }
 
-/// Avatar entities from SceneEntityAppearNotify-shaped payloads: `{8:
-/// [SceneEntityInfo]}` where avatar entities are `{1: type=1 (avatar),
-/// 2: entity_id, 10: SceneAvatarInfo{1: uid, 2: avatar_id}}`.
-/// Command-id agnostic — the cmd rotated in 7.2 (was 27685), the message
-/// shape did not; the shape itself (type=1 + uid + avatar_id) is the
-/// discriminator.
+/// Avatar entities from appear-shaped payloads. The entity list has
+/// moved between top-level fields across versions (f8 ≤ 7.1, f2 since
+/// 7.2) — ANY top-level bytes field is a candidate; the entity shape is
+/// the discriminator: `{1: type=1 (avatar), 2: entity_id}` plus a
+/// SceneAvatarInfo `{1: uid, 2: avatar_id}` at field 10 (stable home)
+/// or nested one level deeper (7.2's team sync carries it at f12→f10).
 pub fn detect_avatar_entities(cmd: &GameCommand) -> Vec<AvatarEntity> {
     if cmd.proto_data.len() < 8 || cmd.proto_data.len() > 131_072 {
         return Vec::new();
@@ -483,45 +483,33 @@ pub fn detect_avatar_entities(cmd: &GameCommand) -> Vec<AvatarEntity> {
     let Some(fields) = parse(&cmd.proto_data) else {
         return out;
     };
-    for (f, v) in &fields {
-        // Entity list: field 2 since 7.2 (verified from runtime dumps),
-        // field 8 up to 7.1 — accept both.
-        if !matches!(*f, 2 | 8) {
-            continue;
-        }
+    for (_, v) in fields.iter().take(128) {
         let Some(bytes) = v.as_bytes() else { continue };
         let Some(entity) = parse(bytes) else { continue };
-        let mut entity_type = None;
-        let mut entity_id = None;
+        // ProtEntityType 1 = avatar.
+        if find_varint(&entity, 1) != Some(1) {
+            continue;
+        }
+        let Some(entity_id) = find_varint(&entity, 2) else { continue };
         let mut uid = None;
         let mut avatar_id = None;
-        for (ef, ev) in &entity {
-            match *ef {
-                1 => entity_type = ev.as_varint(),
-                2 => entity_id = ev.as_varint(),
-                // oneof avatar = SceneAvatarInfo
-                10 => {
-                    if let Some(av) = ev.as_bytes() {
-                        if let Some(af) = parse(av) {
-                            for (afn, avv) in &af {
-                                match *afn {
-                                    1 => uid = avv.as_varint(),
-                                    2 => avatar_id = avv.as_varint(),
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
+        if let Some(av) = find_bytes(&entity, 10) {
+            if let Some(af) = parse(av) {
+                uid = find_varint(&af, 1);
+                avatar_id = find_varint(&af, 2);
             }
         }
-        // ProtEntityType 1 = avatar.
-        if entity_type == Some(1) {
-            if let (Some(id), Some(u), Some(a)) = (entity_id, uid, avatar_id)
+        if uid.is_none() {
+            if let Some(found) = find_avatar_deep(&entity, 0) {
+                (uid, avatar_id) = (Some(found.0), Some(found.1));
+            }
+        }
+        if let (Some(u), Some(a)) = (uid, avatar_id) {
+            if (100_000_000..=999_999_999).contains(&u)
+                && (10_000_000..=13_000_000).contains(&a)
             {
                 out.push(AvatarEntity {
-                    entity_id: id,
+                    entity_id,
                     uid: u as u32,
                     avatar_id: a as u32,
                 });
@@ -529,6 +517,31 @@ pub fn detect_avatar_entities(cmd: &GameCommand) -> Vec<AvatarEntity> {
         }
     }
     out
+}
+
+/// Depth-limited search for a SceneAvatarInfo-shaped `{1: uid (9-digit),
+/// 2: avatar_id (10–13 M)}` submessage under an entity.
+fn find_avatar_deep(entity: &Fields, depth: u32) -> Option<(u64, u64)> {
+    if depth > 1 {
+        return None;
+    }
+    for (_, v) in entity {
+        let Some(sub) = v.as_bytes() else { continue };
+        let Some(sf) = parse(sub) else { continue };
+        if let (Some(u), Some(a)) =
+            (find_varint(&sf, 1), find_varint(&sf, 2))
+        {
+            if (100_000_000..=999_999_999).contains(&u)
+                && (10_000_000..=13_000_000).contains(&a)
+            {
+                return Some((u, a));
+            }
+        }
+        if let Some(found) = find_avatar_deep(&sf, depth + 1) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// Recursive search for a `{1: uid, 2: avatar_id}` submessage with the
@@ -561,11 +574,12 @@ pub fn find_uid_shape(buf: &[u8], uid: u32, depth: u32) -> Option<Vec<u32>> {
     None
 }
 
-/// Gadget spawns from SceneEntityAppearNotify-shaped payloads:
-/// `{8: [SceneEntityInfo]}` where gadget entities are
-/// `{1: type=4, 2: entity_id, 4: motion{1: pos{1,2,3}},
-///   13: gadget{1: gadget_id, 3: config_id}}`.
-/// Builds the registry that turns GadgetInteractRsp entity ids into
+/// Gadget spawns from appear-shaped payloads. Any top-level bytes field
+/// is an entity-list candidate (f8 ≤ 7.1, f2 since 7.2); gadget entities
+/// are `{1: type=4, 2: entity_id, 4: motion{1: pos{1,2,3}},
+/// 13: gadget{1: gadget_id, 2: group_id}}` — with depth-2 fallbacks for
+/// the motion and gadget submessages so inner reshuffles don't break the
+/// registry. Builds the registry that turns interact entity ids into
 /// exact world positions. Command-id agnostic (was 27685 pre-7.2).
 pub fn detect_gadget_spawns(cmd: &GameCommand) -> Vec<GadgetSpawn> {
     if cmd.proto_data.len() < 8 || cmd.proto_data.len() > 131_072 {
@@ -578,68 +592,93 @@ pub fn detect_gadget_spawns(cmd: &GameCommand) -> Vec<GadgetSpawn> {
     else {
         return out;
     };
-    for (f, v) in &fields {
-        // Entity list: field 2 since 7.2 (verified from runtime dumps),
-        // field 8 up to 7.1 — accept both.
-        if !matches!(*f, 2 | 8) {
-            continue;
-        }
+    for (_, v) in fields.iter().take(128) {
         let Some(bytes) = v.as_bytes() else { continue };
         let Some(entity) = parse(bytes) else { continue };
-        let mut entity_type = None;
-        let mut entity_id = None;
+        // ProtEntityType 4 = gadget.
+        if find_varint(&entity, 1) != Some(4) {
+            continue;
+        }
+        let Some(entity_id) = find_varint(&entity, 2) else { continue };
+        // Position: motion at field 4 is the stable home; fall back to
+        // the first world-plausible vector one level down.
         let mut pos = None;
-        let mut gadget_id = None;
-        let mut group_id = None;
-        for (ef, ev) in &entity {
-            match *ef {
-                1 => entity_type = ev.as_varint(),
-                2 => entity_id = ev.as_varint(),
-                4 => {
-                    if let Some(motion) = ev.as_bytes() {
-                        if let Some(mf) = parse(motion) {
-                            for (mfn, mv) in &mf {
-                                if *mfn == 1 {
-                                    if let Some(pos_bytes) = mv.as_bytes()
-                                    {
-                                        pos = parse_vector(pos_bytes);
-                                    }
-                                }
-                            }
-                        }
-                    }
+        if let Some(motion) = find_bytes(&entity, 4) {
+            if let Some(mf) = parse(motion) {
+                if let Some(pos_bytes) = find_bytes(&mf, 1) {
+                    pos = parse_vector(pos_bytes);
                 }
-                13 => {
-                    if let Some(gadget) = ev.as_bytes() {
-                        if let Some(gf) = parse(gadget) {
-                            for (gfn, gv) in &gf {
-                                match *gfn {
-                                    1 => gadget_id = gv.as_varint(),
-                                    2 => group_id = gv.as_varint(),
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
             }
         }
-        // ProtEntityType 4 = gadget.
-        if entity_type == Some(4) {
-            if let (Some(id), Some((x, y, z))) = (entity_id, pos) {
-                out.push(GadgetSpawn {
-                    entity_id: id,
-                    gadget_id: gadget_id.unwrap_or(0),
-                    group_id: group_id.unwrap_or(0),
-                    x,
-                    y,
-                    z,
-                });
+        if pos.is_none() {
+            pos = find_vector_deep(&entity);
+        }
+        let Some((x, y, z)) = pos else { continue };
+        // Gadget payload: field 13 preferred, else a depth-2 submessage
+        // whose field 1 is a gadget-family id (60–80 M covers the known
+        // 70.2x/70.3x/70.5x/70.6x/73.1x families incl. regionals).
+        let mut gadget_id = 0u64;
+        let mut group_id = 0u64;
+        if let Some(gadget) = find_bytes(&entity, 13) {
+            if let Some(gf) = parse(gadget) {
+                gadget_id = find_varint(&gf, 1).unwrap_or(0);
+                group_id = find_varint(&gf, 2).unwrap_or(0);
+            }
+        }
+        if gadget_id == 0 {
+            if let Some((gid, grp)) = find_gadget_deep(&entity, 0) {
+                gadget_id = gid;
+                group_id = grp;
+            }
+        }
+        out.push(GadgetSpawn {
+            entity_id,
+            gadget_id,
+            group_id,
+            x,
+            y,
+            z,
+        });
+    }
+    out
+}
+
+/// First world-plausible vector nested as sub.f1 one level under the
+/// entity (motion-shape fallback).
+fn find_vector_deep(entity: &Fields) -> Option<(f32, f32, f32)> {
+    for (_, v) in entity {
+        let Some(sub) = v.as_bytes() else { continue };
+        let Some(sf) = parse(sub) else { continue };
+        if let Some(vb) = find_bytes(&sf, 1) {
+            if let Some(p) = parse_vector(vb) {
+                if is_world_position(p.0, p.1, p.2) {
+                    return Some(p);
+                }
             }
         }
     }
-    out
+    None
+}
+
+/// Depth-limited search for a gadget payload shaped
+/// `{1: gadget_id (60–80 M), 2?: group_id}` under an entity.
+fn find_gadget_deep(entity: &Fields, depth: u32) -> Option<(u64, u64)> {
+    if depth > 1 {
+        return None;
+    }
+    for (_, v) in entity {
+        let Some(sub) = v.as_bytes() else { continue };
+        let Some(sf) = parse(sub) else { continue };
+        if let Some(g) = find_varint(&sf, 1) {
+            if (60_000_000..=80_000_000).contains(&g) {
+                return Some((g, find_varint(&sf, 2).unwrap_or(0)));
+            }
+        }
+        if let Some(found) = find_gadget_deep(&sf, depth + 1) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// DungeonChallengeBeginNotify (7266): `{6: group_id, 12:

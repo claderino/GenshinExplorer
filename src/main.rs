@@ -374,10 +374,38 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
             std::collections::HashSet::new();
         // Map-layer carrier learning: `{4: layer_id}` (or empty = default
         // layer) fires from many unrelated cmds, so only KNOWN layer ids
-        // are accepted from any cmd; an empty payload counts as "default
-        // layer" only from the cmd that most recently carried a known id.
+        // are accepted from any cmd — plus ANY id (known or not) from the
+        // learned carrier cmd, so NEW regions' layers still reach the
+        // teach/learn flow. The carrier persists across sessions; an
+        // empty payload counts as "default layer" only from the carrier.
         let known_layer_ids = crate::mapwin::MapWindow::known_layer_ids();
-        let mut layer_carrier_cmd: Option<u16> = None;
+        // User-editable scene→map overrides: when a patch adds a region,
+        // its unknown scene id is logged once; adding
+        // `{"<scene_id>": <map_id>}` here maps it WITHOUT a rebuild.
+        let scene_overrides: std::collections::HashMap<u64, u32> =
+            std::fs::read_to_string(data_dir.join("scene_overrides.json"))
+                .ok()
+                .and_then(|t| {
+                    serde_json::from_str::<
+                        std::collections::HashMap<String, u32>,
+                    >(&t)
+                    .ok()
+                })
+                .map(|m| {
+                    m.into_iter()
+                        .filter_map(|(k, v)| {
+                            k.parse::<u64>().ok().map(|k| (k, v))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+        let mut layer_carrier_cmd: Option<u16> = std::fs::read_to_string(
+            data_dir.join("layer_carrier.json"),
+        )
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("cmd").and_then(|c| c.as_u64()))
+        .map(|c| c as u16);
         // Scene-id tracking (9582 PlayerEnterSceneNotify) — the
         // authoritative "which world am I in" signal. Separate regions
         // (Chasm, moon, Enkanomiya, …) each have their own scene and
@@ -587,19 +615,28 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                             if let Some(layer_id) =
                                 explore::detect_map_layer(&command.proto_data)
                             {
+                                let from_carrier = layer_carrier_cmd
+                                    == Some(command.command_id);
                                 let accept = match layer_id {
                                     Some(id) => {
                                         known_layer_ids.contains(&id)
+                                            || from_carrier
                                     }
-                                    None => {
-                                        layer_carrier_cmd
-                                            == Some(command.command_id)
-                                    }
+                                    None => from_carrier,
                                 };
                                 if accept {
-                                    if layer_id.is_some() {
+                                    if layer_id.is_some()
+                                        && !from_carrier
+                                    {
                                         layer_carrier_cmd =
                                             Some(command.command_id);
+                                        let _ = std::fs::write(
+                                            data_dir.join("layer_carrier.json"),
+                                            serde_json::json!({
+                                                "cmd": command.command_id
+                                            })
+                                            .to_string(),
+                                        );
                                     }
                                     if carriers.insert((
                                         "map-layer",
@@ -661,7 +698,7 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                 // resolve interact ids to stale
                                 // positions.
                                 gadget_registry.clear();
-                                let mapped = match scene {
+                                let mapped = scene_overrides.get(&scene).copied().or_else(|| match scene {
                                     429_4906_403 => Some(2u32),  // Teyvat
                                     429_4906_400 => Some(9u32),  // Chasm mines
                                     429_4906_401 => Some(7u32),  // Enkanomiya
@@ -670,7 +707,7 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                     429_4906_497 => Some(36u32), // Ancient Sacred Mountain
                                     429_4906_503 => Some(37u32), // Temple of Space
                                     _ => None,
-                                };
+                                });
                                 if let Some(map_id) = mapped {
                                     if active_region != Some(map_id) {
                                         active_region = Some(map_id);
@@ -683,8 +720,9 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                     seen_unknown_scenes.push(scene);
                                     tracing::info!(
                                         scene,
-                                        "unknown scene id — visit-logged \
-                                         for region mapping"
+                                        "unknown scene id — add {{\"{scene}\": <map_id>}} \
+                                         to scene_overrides.json (next to app.log) \
+                                         to map it, or ignore",
                                     );
                                 }
                             }

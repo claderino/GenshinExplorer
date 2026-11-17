@@ -308,3 +308,28 @@ cmd-agnostic (see explore.rs). The worker logs `carrier identified:
 mapping is always recoverable from app.log after any version bump.
 Still keyed on observed ids pending re-observation: challenge begin
 (was 7266), gadget state (was 22292), token-exchange dump (23252/3713).
+
+## 14. Shape-finder hardening (2026-11-17, post-7.2)
+
+Observed 7.2 carriers (from runtime `carrier identified` logs):
+- batch-move 24007 (was 2246), scene-enter 6368 (was 9582),
+  map-layer 28327 (was 5991), appear-family 4469 (entity list at TOP
+  FIELD 2; was 27685 with list at field 8), team sync 1144
+  (avatar info nested f12->f10)
+
+Hardening so future rotations/expansions degrade instead of break:
+- entity lists: ANY top-level bytes field is a candidate; the entity
+  shape (type 1 avatar / 4 gadget + entity_id) is the discriminator
+- avatar info: field 10 preferred, depth-2 fallback (team-sync shape)
+- gadget motion: field 4 preferred, depth-2 vector fallback; gadget
+  payload: field 13 preferred, depth-2 fallback gated on gadget-id
+  range 60-80M
+- map-layer: carrier cmd persists in layer_carrier.json; once a
+  carrier is known, ANY layer id from it reaches the teach/learn flow
+  (new regions' floors stay learnable), while non-carrier cmds must
+  carry KNOWN layer ids to count
+- scene ids: scene_overrides.json (beside app.log) maps unknown
+  scene ids to map ids without a rebuild; unknown scenes are logged
+  once with the exact line to paste
+- calibration: files record their map origin and auto-migrate when a
+  patch shifts it (see 7.2 Snezhnaya: origin moved ~7,500 px)
