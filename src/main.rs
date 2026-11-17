@@ -292,6 +292,10 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
         // fired — gates batch entity learning: the reference position
         // must be fresh enough that the player can't have moved far.
         let mut last_direct_at: Option<std::time::Instant> = None;
+        // Last accepted position from ANY carrier (batch or direct).
+        // Entity re-learning uses this when the direct carrier is gone
+        // (7.2 removed it — it was never identified in captures).
+        let mut last_any_position_at: Option<std::time::Instant> = None;
         // When the learned entity id last matched a batch entry —
         // entity ids change on scene loads, so a silent id means the
         // avatar got a new one and we must re-learn.
@@ -359,6 +363,10 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
             .create(true)
             .append(true)
             .open(data_dir.join("avatar_appear.jsonl"))?;
+        let mut pos_log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(data_dir.join("pos_carrier.jsonl"))?;
         let mut scene_capture_until: Option<std::time::Instant> = None;
         let mut scene_event: u64 = 0;
         let mut last_sent_pos: Option<(f32, f32, f32)> = None;
@@ -1273,6 +1281,47 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
 
                         // Player position: direct carrier (ground truth, ~every 6s)
                         // + batch carrier filtered by learned entity_id (~1Hz).
+                        // Research: dump small packets carrying shallow
+                        // position vectors once per cmd (7.2 reshuffled the
+                        // appear layout; the direct carrier may have too).
+                        if command.proto_data.len() <= 256 {
+                            if let Some(path) = explore::find_vector_shape(
+                                &command.proto_data,
+                                0,
+                            ) {
+                                if path.len() <= 2
+                                    && carriers.insert((
+                                        "pos-shape",
+                                        command.command_id,
+                                    ))
+                                {
+                                    tracing::info!(
+                                        cmd = command.command_id,
+                                        path = ?path,
+                                        len = command.proto_data.len(),
+                                        "pos-shape carrier — dumped"
+                                    );
+                                    use std::io::Write;
+                                    let hex: String = command
+                                        .proto_data
+                                        .iter()
+                                        .map(|b| format!("{b:02x}"))
+                                        .collect();
+                                    let _ = writeln!(
+                                        pos_log,
+                                        "{}",
+                                        serde_json::json!({
+                                            "ts": chrono::Local::now().to_rfc3339_opts(
+                                                chrono::SecondsFormat::Millis, true),
+                                            "cmd": command.command_id,
+                                            "path": path,
+                                            "len": command.proto_data.len(),
+                                            "hex": hex,
+                                        })
+                                    );
+                                }
+                            }
+                        }
                         if let Some(motion) = explore::detect_player_position(command) {
                             if carriers.insert((
                                 "direct-pos",
@@ -1287,6 +1336,8 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                 let (px, py, pz) = pos_tracker.last.unwrap();
                                 last_position_at = Some(std::time::Instant::now());
                                 last_direct_at = Some(std::time::Instant::now());
+                                last_any_position_at =
+                                    Some(std::time::Instant::now());
                                 // Divergence eviction: the direct carrier
                                 // is ground truth — if the learned batch
                                 // entity's position disagrees by a lot,
@@ -1449,18 +1500,29 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                 _ => {}
                             }
                             if player_entity_id.is_none() {
-                                // Learning: nearest entry to a fresh
-                                // direct fix, within an age-scaled
-                                // radius.
-                                if let (
-                                    Some((lx, _ly, lz)),
-                                    Some(direct_at),
-                                ) = (pos_tracker.last, last_direct_at)
                                 {
-                                    let age = direct_at
-                                        .elapsed()
-                                        .as_secs_f32();
-                                    if age < 12.0 {
+                                // Learning reference: prefer a FRESH direct
+                                // fix; when the direct carrier is absent
+                                // (7.2) use the last accepted position from
+                                // the batch carrier itself — movement is
+                                // continuous within seconds.
+                                let reference = match (
+                                    pos_tracker.last,
+                                    last_direct_at,
+                                ) {
+                                    (Some(p), Some(t))
+                                        if t.elapsed().as_secs_f32() < 12.0 =>
+                                    {
+                                        Some((p, t.elapsed().as_secs_f32()))
+                                    }
+                                    (Some(p), _) => last_any_position_at
+                                        .filter(|t| {
+                                            t.elapsed().as_secs_f32() < 12.0
+                                        })
+                                        .map(|t| (p, t.elapsed().as_secs_f32())),
+                                    _ => None,
+                                };
+                                if let Some(((lx, _ly, lz), age)) = reference {
                                         // Real movement is ~7.5-10
                                         // units/s (run/sprint) — 20 +
                                         // 9/s covers it with margin; the
@@ -1526,6 +1588,8 @@ fn worker_main(tx: Sender<Msg>) -> Result<()> {
                                         });
                                     }
                                     last_player_batch_at =
+                                        Some(std::time::Instant::now());
+                                    last_any_position_at =
                                         Some(std::time::Instant::now());
                                     player_batch_pos = Some((
                                         motion.x,

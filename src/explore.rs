@@ -469,7 +469,40 @@ pub struct AvatarEntity {
     pub avatar_id: u32,
 }
 
-/// Avatar entities from appear-shaped payloads. The entity list has
+/// Depth-limited search for a world-position vector `{1,2,3 fixed32}`
+/// anywhere in a payload; returns the field-number path. Used by the
+/// worker's one-shot research dump so a reshuffled position carrier can
+/// be identified from a live session (captures truncate at 512 B).
+pub fn find_vector_shape(buf: &[u8], depth: u32) -> Option<Vec<u32>> {
+    if depth > 3 {
+        return None;
+    }
+    let (fields, _) = parse_partial(buf)?;
+    let mut v = [None, None, None];
+    for (num, val) in &fields {
+        if (1..=3).contains(num) {
+            if let Some(f) = val.as_f32() {
+                v[(*num - 1) as usize] = Some(f);
+            }
+        }
+    }
+    if let (Some(x), Some(y), Some(z)) = (v[0], v[1], v[2]) {
+        if is_world_position(x, y, z) {
+            return Some(Vec::new());
+        }
+    }
+    for (num, val) in &fields {
+        if let Some(sub) = val.as_bytes() {
+            if let Some(mut path) = find_vector_shape(sub, depth + 1) {
+                path.insert(0, *num);
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// Actor/avatar entity from appear-shaped payloads. The entity list has
 /// moved between top-level fields across versions (f8 ≤ 7.1, f2 since
 /// 7.2) — ANY top-level bytes field is a candidate; the entity shape is
 /// the discriminator: `{1: type=1 (avatar), 2: entity_id}` plus a

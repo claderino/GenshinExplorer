@@ -333,3 +333,18 @@ Hardening so future rotations/expansions degrade instead of break:
   once with the exact line to paste
 - calibration: files record their map origin and auto-migrate when a
   patch shifts it (see 7.2 Snezhnaya: origin moved ~7,500 px)
+
+## 15. Batch-only tracking after the direct carrier vanished (7.2)
+
+The direct-position carrier (7.1 cmd 26016, shape f1->f7 Vector) was
+never identified in 7.2: pure cmd-id rotation would NOT have broken it
+(the detector is cmd-agnostic), so its shape must have changed too.
+Consequences and fixes:
+- entity re-learning used to REQUIRE a fresh direct fix; after a
+  character switch / scene churn the player entity went stale and the
+  dot froze forever. It now falls back to the last accepted batch
+  position as the reference (movement is continuous within seconds).
+- worker dumps small shallow-vector packets once per cmd to
+  pos_carrier.jsonl (logs `pos-shape carrier — dumped`) so the new
+  direct layout can be derived from one short session, exactly like
+  the avatar-appear dump.
